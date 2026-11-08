@@ -1,3 +1,4 @@
+# 공통: 저장소 전반의 Python 생성물, 로컬 설정, 빌드 결과물
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -218,3 +219,59 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# frontend: 의존성, 빌드 결과물, 개발 환경 파일
+# 설치한 패키지
+frontend/**/node_modules/
+# 배포 빌드 결과물
+frontend/**/dist/
+# 별도 빌드 결과물
+frontend/**/build/
+# 도구 캐시
+frontend/**/.cache/
+# 로컬 환경 변수 파일
+frontend/**/.env*
+# 공유용 환경 변수 예시는 추적
+!frontend/**/.env.example
+# Vite 캐시
+frontend/**/.vite/
+# 편집기 개인 설정
+/frontend/.vscode/
+# Vite 임시 설정 파일
+frontend/**/vite.config.*.timestamp-*
+# TypeScript 증분 빌드 정보
+frontend/**/*.tsbuildinfo
+# 패키지 관리자 디버그 로그
+frontend/**/*-debug.log*
+# 애플리케이션 로그 디렉터리
+frontend/**/logs/
+# 일반 로그 파일
+frontend/**/*.log
+# Claude 세션 임시 파일
+frontend/**/.claude-replay.*
+# 임시 작업 파일
+frontend/**/.tmp-*
+# Figma 디자인 컨텍스트 생성물
+/frontend/.figma/design-context/
+# 플랫폼에서 관리하는 플러그인 상태
+/frontend/.plugins/
+# 플랫폼에서 관리하는 스킬 상태
+/frontend/.opencode-skills/
+# pnpm 로컬 저장소
+frontend/**/.pnpm-store/
+# 프로젝트 내부 설정 문서
+frontend/**/SUPABASE_SETUP.md
+
+# backend: 서버의 로컬 비밀 정보와 개발 생성물
+# 서버 환경 변수와 비밀 정보
+backend/**/.env
+# 편집기 개인 설정
+backend/**/.vscode/
+# Python 가상 환경
+backend/**/.venv/
+# Python 바이트코드 캐시
+backend/**/__pycache__/
+# 컴파일된 Python 파일
+backend/**/*.py[cod]
+# pytest 실행 캐시
+backend/**/.pytest_cache/
