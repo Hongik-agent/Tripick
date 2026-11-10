@@ -7,13 +7,33 @@ from urllib.error import HTTPError
 from uuid import uuid4
 
 from fastapi import HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.datastructures import Headers
 
 
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/test")
 os.environ.setdefault("SUPABASE_URL", "https://example.supabase.co")
 os.environ.setdefault("SUPABASE_PUBLISHABLE_KEY", "test-key")
+os.environ.setdefault("FRONTEND_ORIGIN", "https://frontend.example")
 
 from app import main  # noqa: E402
+
+
+class CorsTest(unittest.TestCase):
+    def test_configured_frontend_can_put_with_authorization(self) -> None:
+        cors = main.app.build_middleware_stack().app.app
+        self.assertIsInstance(cors, CORSMiddleware)
+        response = cors.preflight_response(
+            Headers(
+                {
+                    "origin": main.frontend_origin,
+                    "access-control-request-method": "PUT",
+                    "access-control-request-headers": "authorization",
+                }
+            )
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["access-control-allow-origin"], main.frontend_origin)
 
 
 class AuthTest(unittest.IsolatedAsyncioTestCase):

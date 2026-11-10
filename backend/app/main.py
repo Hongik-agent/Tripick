@@ -5,16 +5,23 @@ from urllib.request import Request, urlopen
 from uuid import UUID
 
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
 
-from .config import supabase_publishable_key, supabase_url
+from .config import frontend_origin, supabase_publishable_key, supabase_url
 from .db import engine
 from .models import users
 
 
 app = FastAPI(title="Tripick API")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[frontend_origin],
+    allow_methods=["PUT"],
+    allow_headers=["Authorization"],
+)
 
 
 def supabase_user(token: str) -> dict:
