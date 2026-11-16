@@ -14,7 +14,7 @@
 
 - `auth.py`: Supabase OAuth 시작·PKCE 코드 교환·암호화·불투명 쿠키 세션·요청 시 갱신·CSRF·현재 기기 로그아웃.
 - `domain.py`: 일정 조회·삭제·검증 초안 저장/재저장 경계, 3개 한도·멱등성·버전·소유권, 공개 닉네임·게시 사본·하트.
-- `planning.py`: 기존 선택 여행지 49곳, 중심 좌표와 안정적 ID, 날짜·선택지 검증. 지역별 실제 경로 지원은 아직 검증하지 않았다.
+- `planning.py`: 선택 여행지 42곳, 중심 좌표와 안정적 ID, 날짜·선택지 검증. 지역별 실제 경로 지원은 아직 검증하지 않았다.
 - `models.py`, `0002_server_storage`: 사용자 닉네임·auth_sessions·trips·posts·post_hearts·idempotency_keys. 기존 users 보존. `0003_bff_oauth`에 일회용 로그인 트랜잭션 추가.
 - `main.py`, `config.py`: 오류 구조, 정확한 Origin·CORS, no-store, 환경설정 집중. `/health` DB 실패 503.
 

@@ -21,19 +21,18 @@ import WorldMap from "./WorldMap"
 import { login } from "./auth"
 
 const countryLabels: Record<string, string> = {
+  KR: "한국",
   JP: "일본",
   CN: "중국",
   HK: "홍콩",
   TW: "대만",
   MO: "마카오",
-  KR: "한국",
   FR: "프랑스",
   IT: "이탈리아",
   ES: "스페인",
   GB: "영국",
   US: "미국",
   TH: "태국",
-  ID: "인도네시아",
 }
 
 const initial: Conditions = {

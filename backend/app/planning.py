@@ -6,6 +6,15 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # GeoNames 등 검토 좌표의 출처/라이선스는 docs/specs/06-implementation.md 참조.
 # 지도 바탕의 중심점이며 실제 방문 장소/경로의 검증 근거가 아니다.
 ROWS = [
+('kr-seoul','서울','KR','Asia/Seoul',37.566,126.978,11),
+('kr-jeju','제주','KR','Asia/Seoul',33.4016667,126.5461111,9),
+('kr-incheon','인천','KR','Asia/Seoul',37.456,126.705,11),
+('kr-gangneung','강릉','KR','Asia/Seoul',37.752657,128.872392,11),
+('kr-sokcho','속초','KR','Asia/Seoul',38.20701,128.59181,11),
+('kr-yeosu','여수','KR','Asia/Seoul',34.760622,127.66215,11),
+('kr-busan','부산','KR','Asia/Seoul',35.102,129.030,11),
+('kr-gyeongju','경주','KR','Asia/Seoul',35.84278,129.21167,11),
+('kr-jeonju','전주','KR','Asia/Seoul',35.82483,127.14796,11),
 ('jp-tokyo','도쿄','JP','Asia/Tokyo',35.690,139.692,11),
 ('jp-osaka','오사카','JP','Asia/Tokyo',34.694,135.501,11),
 ('jp-sapporo','삿포로','JP','Asia/Tokyo',43.067,141.350,11),
@@ -22,15 +31,6 @@ ROWS = [
 ('tw-kaohsiung','가오슝','TW','Asia/Taipei',22.616,120.313,11),
 ('tw-taichung','타이중','TW','Asia/Taipei',24.147,120.684,11),
 ('mo-macau','마카오','MO','Asia/Macau',22.20056,113.54611,11),
-('kr-seoul','서울','KR','Asia/Seoul',37.566,126.978,11),
-('kr-jeju','제주','KR','Asia/Seoul',33.4016667,126.5461111,9),
-('kr-incheon','인천','KR','Asia/Seoul',37.456,126.705,11),
-('kr-gangneung','강릉','KR','Asia/Seoul',37.752657,128.872392,11),
-('kr-sokcho','속초','KR','Asia/Seoul',38.20701,128.59181,11),
-('kr-yeosu','여수','KR','Asia/Seoul',34.760622,127.66215,11),
-('kr-busan','부산','KR','Asia/Seoul',35.102,129.030,11),
-('kr-gyeongju','경주','KR','Asia/Seoul',35.84278,129.21167,11),
-('kr-jeonju','전주','KR','Asia/Seoul',35.82483,127.14796,11),
 ('fr-paris','파리','FR','Europe/Paris',48.853,2.349,11),
 ('fr-nice','니스','FR','Europe/Paris',43.703,7.266,11),
 ('fr-lyon','리옹','FR','Europe/Paris',45.749,4.848,11),
@@ -59,13 +59,16 @@ ROWS = [
 DESTINATIONS = {r[0]: dict(id=r[0], label=r[1], countryCode=r[2], timeZone=r[3],
     mapCenter=dict(latitude=r[4], longitude=r[5]), mapZoom=r[6], mapProviders=['google'],
     transportModes=[]) for r in ROWS}
+# 기존 저장 일정의 조회·게시에는 좌표가 필요하므로 선택 대상에서만 제외한다.
+RETIRED_DESTINATION_IDS = {'id-bali', 'id-jakarta', 'id-yogyakarta', 'gb-edinburgh',
+    'es-seville', 'fr-lyon', 'tw-taichung'}
 INTERESTS = dict(food='맛집 탐방', nature='자연과 휴식', culture='예술과 문화', shopping='쇼핑', activity='액티비티', local_culture='현지문화')
 
 
 def options():
     choices = lambda values: [dict(id=k, label=v) for k, v in values.items()]
     return dict(optionsVersion='v1', maxTripDays=7, generationAvailable=False,
-        destinations=list(DESTINATIONS.values()),
+        destinations=[d for key, d in DESTINATIONS.items() if key not in RETIRED_DESTINATION_IDS],
         companionTypes=choices(dict(solo='혼자', friends='친구와', partner='연인과', family='가족과')),
         partySizes=choices({'1':'1명','2':'2명','3':'3명','4':'4명','5_plus':'5명 이상'}),
         interests=choices(INTERESTS), paces=choices(dict(relaxed='여유롭게', balanced='알차게', packed='빼곡하게')),
@@ -96,7 +99,7 @@ class Conditions(BaseModel):
 
     @model_validator(mode='after')
     def valid(self):
-        if self.destinationId not in DESTINATIONS or not 0 <= (self.endDate-self.startDate).days < 7:
+        if self.destinationId not in DESTINATIONS or self.destinationId in RETIRED_DESTINATION_IDS or not 0 <= (self.endDate-self.startDate).days < 7:
             raise ValueError('허용 여행지와 1~7일 여행 기간을 확인해 주세요.')
         if self.party.typeId == 'solo' and self.party.sizeBand != '1':
             raise ValueError('혼자 여행은 1명만 선택할 수 있습니다.')
