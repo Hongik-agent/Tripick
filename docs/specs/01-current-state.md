@@ -1,32 +1,25 @@
-# 01 · 현재 구현과 차이
+# 01 · 현재 구현과 남은 차이
 
-확인일: 2026-11-06. 코드를 읽어 확인한 정적 상태다. 외부 OAuth 로그인 성공은 별도 검증이 필요하다.
+2026-11-16 코드 기준. 최신 인증 결정은 [ADR 0005](../adr/0005-supabase-bff.md), 설정은 [06 구현·운영](06-implementation.md)을 따른다.
 
 ## 프런트엔드
 
-- `frontend/src/App.tsx`: React 단일 화면 흐름. 선택형 조건, 예시 기반 생성, 결과·저장·편집·삭제 UI가 있다. 생성은 `setTimeout` 후 예시 데이터를 선택하며 실제 AI·장소·경로 API를 호출하지 않는다.
-- 날짜 입력은 화면에 있으나 현재 생성 모의 함수가 날짜별 결과를 만들지 않는다. 인원 `<select>`는 상태에 연결되지 않았다. API 전환 시 필수 날짜·인원 구간·이동수단 필드를 화면과 연동해야 한다.
-- `frontend/src/supabase.ts`: 환경 변수가 있으면 Supabase 클라이언트를 만들고 Google OAuth를 시작한다. Supabase SDK 기본 설정으로 인증 세션은 브라우저에 유지된다. Kakao 로그인 버튼은 아직 없다.
-- 로그인 세션이 생기면 프런트가 `PUT /api/users/me`로 Supabase 토큰을 FastAPI에 보내 사용자 행을 저장한다. 서버 저장 실패 시 앱은 로그인 상태로 전환하지 않는다. 개발 중 `/api`는 Vite가 FastAPI로 프록시한다.
-- 저장 일정은 Supabase 사용자 ID별 `localStorage`에 보관된다. 최대 3개는 브라우저 상태에서 검사한다. 다른 기기 동기화나 서버 측 소유권·동시 저장 보장은 없다.
-- 지도와 동선은 모의 그림이다. 장소 검색용 외부 지도 링크가 있으나 내장 지도·이동시간 재계산은 실제 API 결과가 아니다.
-- `frontend/src/community.tsx`와 `App.tsx`: 게시·하트·정렬이 `localStorage` 기반으로 동작한다. 다른 사용자·기기 사이에 데이터가 공유되지 않는다.
-- `frontend/README.md`와 `SUPABASE_SETUP.md`는 Google OAuth가 실제 인증 경로이며 일정·커뮤니티는 브라우저 모의 저장이라는 경계를 구분한다. 실제 외부 로그인 성공은 별도 실행 검증이 필요하다.
+- `auth.ts`: BFF 로그인 시작 API를 호출하고 Supabase authorize URL로 이동한다. 브라우저에서 코드 교환·토큰 보관을 하지 않는다.
+- `api.ts`: 쿠키·CSRF API 호출, 세션 복원, 공개 조회 시 만료 쿠키 정리 후 한 번 재조회. 이전 인증 항목 정리는 사용자 확인으로 완료했으며 localStorage 정리 코드는 제거했다.
+- `App.tsx`: 서버 일정·커뮤니티·하트·닉네임 연결, 저장 실패 표시, 1~7일·인원·이동수단 선택. 실제 생성·편집은 준비 중으로 표시한다.
+- `WorldMap.tsx`: React Simple Maps와 로컬 Natural Earth 기반 world-atlas, 서버에서 읽은 저장 일정 핀.
+- `GoogleMap.tsx`: 기존 서울 전용 로더를 재사용한 모든 여행지 바탕 지도. 장소·실제 동선 마커는 후속 단계다.
 
 ## 백엔드
 
-- `backend/app/main.py`: `GET /health`는 DB 연결을 확인한다. `PUT /api/users/me`는 Supabase Auth에 토큰을 검증하고 Google·Kakao 계정이면 PostgreSQL `users` 행을 생성·갱신한다. 신원을 클라이언트 본문에서 받지 않는다.
-- `backend/app/config.py`, `db.py`: `.env`의 `DATABASE_URL`을 읽고 SQLAlchemy async 엔진을 만든다.
-- Alembic에 `users` 테이블 생성 마이그레이션이 있고, 2026-11-05 대상 DB의 현재 리비전이 `0001_users (head)`임을 확인했다. 장소, 생성, 일정, 커뮤니티 API는 없다.
+- `auth.py`: Supabase OAuth 시작·PKCE 코드 교환·암호화·불투명 쿠키 세션·요청 시 갱신·CSRF·현재 기기 로그아웃.
+- `domain.py`: 일정 조회·삭제·검증 초안 저장/재저장 경계, 3개 한도·멱등성·버전·소유권, 공개 닉네임·게시 사본·하트.
+- `planning.py`: 기존 선택 여행지 49곳, 중심 좌표와 안정적 ID, 날짜·선택지 검증. 지역별 실제 경로 지원은 아직 검증하지 않았다.
+- `models.py`, `0002_server_storage`: 사용자 닉네임·auth_sessions·trips·posts·post_hearts·idempotency_keys. 기존 users 보존. `0003_bff_oauth`에 일회용 로그인 트랜잭션 추가.
+- `main.py`, `config.py`: 오류 구조, 정확한 Origin·CORS, no-store, 환경설정 집중. `/health` DB 실패 503.
 
-## 목표와의 핵심 차이
+## 후속 범위
 
-| 주제 | 현재 | MVP 목표 |
-|---|---|---|
-| 인증 | Supabase Google OAuth와 FastAPI 사용자 저장 API 연결. Kakao 버튼은 미구현 | Google·Kakao, 서버 권한 검사 |
-| 일정 생성 | 예시 데이터와 대기 시간 | 근거 있는 장소·경로 조회와 생성 |
-| 개인 일정 | 브라우저 저장 | 계정별 서버 저장과 3개 한도 |
-| 지도 | 모의 그림과 외부 검색 링크 | 실제 위치·동선 검증 |
-| 커뮤니티 | 같은 브라우저의 모의 게시·하트 | 계정·기기 간 실제 공유 |
+OpenAI SDK 생성, 실제 장소·영업시간·경로 검증, 편집·재생성 작업 저장소, 실제 경로 표시. 운영에서는 미검증 초안을 저장할 수 없고 개발 테스트에서만 검증 초안을 공급한다. 이 단계는 전체 MVP 완료 선언이 아니다.
 
-`outputs`의 2026-10-28 보고서는 당시 OAuth를 임시 버튼으로 미루기로 했지만, 현재 코드에는 이후 작성된 Supabase Google OAuth 경로가 있다. 진행 상태는 코드에, 제품 목표는 최신 사용자 결정과 PRD에 맞춰 구분한다.
+실제 Google/Kakao OAuth 왕복, 운영 Vercel Set-Cookie 전달과 Google Maps 렌더링, 운영 DB 마이그레이션은 별도 배포 환경 확인이 필요하다. 과거 2026-11-05 검증 결과를 현재 변경의 검증 근거로 재사용하지 않는다.
