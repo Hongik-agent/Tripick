@@ -1,0 +1,288 @@
+import asyncio
+import base64
+import hashlib
+import os
+import unittest
+from datetime import timedelta
+from unittest.mock import patch
+from uuid import uuid4
+from urllib.parse import urlsplit, parse_qs
+
+from cryptography.fernet import Fernet
+
+# 운영 .env를 사용하지 않는 전용 로컬 테스트 DB. 실행 전 Alembic upgrade가 필요하다.
+os.environ['DATABASE_URL'] = 'postgresql+asyncpg://postgres@127.0.0.1:55440/tripick_test'
+os.environ['SUPABASE_URL'] = 'https://example.supabase.co'
+os.environ['SUPABASE_PUBLISHABLE_KEY'] = 'test-key'
+os.environ['FRONTEND_ORIGIN'] = 'https://frontend.example'
+os.environ['SESSION_ENCRYPTION_KEY'] = Fernet.generate_key().decode()
+
+import httpx
+from sqlalchemy import insert, delete, select, update, func
+from app import auth, domain, config
+from app.main import app
+from app.models import users, trips, auth_sessions, posts, post_hearts, oauth_transactions
+from app.db import engine
+
+
+class ApiTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.uid, self.other = uuid4(), uuid4()
+        self.sid, self.csrf = uuid4().hex, uuid4().hex
+        stamp = auth.now()
+        async with engine.begin() as conn:
+            await conn.execute(insert(users), [dict(id=self.uid, nickname='User'+self.uid.hex[:12]), dict(id=self.other, nickname='User'+self.other.hex[:12])])
+            await conn.execute(insert(auth_sessions).values(hash=auth.digest(self.sid), user_id=self.uid, csrf=self.csrf,
+                tokens=auth.encrypt(dict(access_token='access', refresh_token='refresh')), created_at=stamp,
+                last_seen=stamp, checked_at=stamp, expires_at=stamp+timedelta(days=7), token_expires_at=stamp+timedelta(hours=1)))
+        self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=config.frontend_origin,
+            headers={'Origin': config.frontend_origin, 'X-CSRF-Token': self.csrf}, cookies={config.session_cookie: self.sid})
+        async def loader():
+            async def load(conn, uid, body):
+                return self.draft(uid, body)
+            return load
+        app.dependency_overrides[domain.verified_drafts] = loader
+
+    async def asyncTearDown(self):
+        app.dependency_overrides.clear()
+        await self.client.aclose()
+        async with engine.begin() as conn:
+            await conn.execute(delete(users).where(users.c.id.in_([self.uid, self.other])))
+            await conn.execute(delete(oauth_transactions))
+        await engine.dispose()
+
+    def conditions(self):
+        return dict(optionsVersion='v1', destinationId='jp-tokyo', startDate='2026-12-01', endDate='2026-12-01',
+            party=dict(typeId='friends', sizeBand='2', withChildren=False, withSeniors=False), interestIds=['food'],
+            paceId='relaxed', transportMode='walking', mapProvider='google')
+
+    def draft(self, uid, body):
+        return dict(ownerId=str(uid), version=1, status='success', expiresAt=auth.now()+timedelta(hours=1),
+            sourceTripId=getattr(self, 'source', None), baseTripVersion=body.baseTripVersion,
+            content=dict(destination=dict(id='jp-tokyo'), conditions=self.conditions(), mapProvider='google', transportMode='walking',
+                days=[dict(day=1, date='2026-12-01', items=[dict(id='item_1', order=1, startTime='10:00', endTime='11:00', reason='test',
+                    place=dict(id='place1', provider='google', providerPlaceId='test-place', name='검증 장소', address='test', latitude=35.0, longitude=139.0, checkedAt='2026-11-15T00:00:00Z'))], legs=[])], warnings=[], unmetConstraints=[]))
+
+    async def create(self, draft=None, key=None):
+        return await self.client.post('/api/trips', json=dict(draftId=draft or 'draft_'+uuid4().hex, draftVersion=1), headers={'Idempotency-Key': key or uuid4().hex})
+
+    async def test_csrf_and_foreign_origin_rejected(self):
+        for headers in ({'X-CSRF-Token': 'wrong'}, {'Origin': 'https://evil.example'}):
+            r = await self.client.put('/api/users/me/nickname', json={'nickname':'ValidName'}, headers=headers)
+            self.assertEqual(r.status_code, 403, r.text)
+
+    async def test_cors(self):
+        for origin, status in ((config.frontend_origin, 200), ('https://evil.example', 400)):
+            r = await self.client.options('/api/trips', headers={'Origin':origin, 'Access-Control-Request-Method':'PUT', 'Access-Control-Request-Headers':'content-type,x-csrf-token,idempotency-key,if-match'})
+            self.assertEqual(r.status_code, status)
+        r = await self.client.options('/api/trips', headers={'Access-Control-Request-Method':'PATCH'})
+        self.assertEqual(r.status_code, 400)
+
+    async def test_auth_no_provider_call_within_interval(self):
+        with patch.object(auth, 'provider_request') as call:
+            for _ in range(2):
+                r = await self.client.get('/api/auth/me')
+                self.assertEqual(r.status_code, 200, r.text)
+            call.assert_not_called()
+        self.assertEqual(r.json()['csrfToken'], self.csrf)
+        self.assertIn('no-store', r.headers['cache-control'])
+        self.assertNotIn('access', r.text)
+
+    async def test_expired_session_revoked_and_cookie_cleared(self):
+        async with engine.begin() as conn:
+            await conn.execute(update(auth_sessions).where(auth_sessions.c.user_id == self.uid).values(last_seen=auth.now()-timedelta(days=2)))
+        r = await self.client.get('/api/auth/me')
+        self.assertEqual(r.status_code, 401)
+        self.assertIn('Max-Age=0', r.headers['set-cookie'])
+        async with engine.connect() as conn:
+            self.assertEqual(await conn.scalar(select(func.count()).select_from(auth_sessions).where(auth_sessions.c.user_id == self.uid)), 0)
+
+    async def test_concurrent_refresh_only_once(self):
+        async with engine.begin() as conn:
+            await conn.execute(update(auth_sessions).where(auth_sessions.c.user_id == self.uid).values(token_expires_at=auth.now()))
+        identity = dict(id=str(self.uid), email=None, app_metadata={'providers':['google']})
+        def provider(path, token=None, body=None):
+            if path.startswith('token'):
+                return dict(access_token='renewed', refresh_token='new-refresh', expires_in=3600, user=identity)
+            return identity
+        with patch.object(auth, 'provider_request', side_effect=provider) as call:
+            result = await asyncio.gather(*[self.client.get('/api/auth/me') for _ in range(3)])
+            self.assertTrue(all(r.status_code == 200 for r in result))
+            self.assertEqual(sum(c.args[0].startswith('token') for c in call.call_args_list), 1)
+
+    async def begin_login(self, return_to='saved'):
+        r = await self.client.post('/api/auth/login/google', json={'returnTo': return_to})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn('HttpOnly', r.headers['set-cookie'])
+        params = parse_qs(urlsplit(r.json()['url']).query)
+        self.assertNotIn('state', params)  # Supabase 자체 state와 분리한다.
+        callback = urlsplit(params['redirect_to'][0])
+        self.assertEqual(callback.scheme+'://'+callback.netloc+callback.path, config.oauth_callback_url)
+        return parse_qs(callback.query)['state'][0], params
+
+    def provider(self, path, token=None, body=None):
+        if path == 'user':
+            return dict(id=str(self.uid), email=None, app_metadata={'providers':['google']})
+        return dict(access_token='new-access', refresh_token='new-refresh', expires_in=3600)
+
+    async def test_bff_code_exchange_and_single_use(self):
+        state, params = await self.begin_login()
+        async with engine.connect() as conn:
+            txn = (await conn.execute(select(oauth_transactions).where(oauth_transactions.c.state_hash == auth.digest(state)))).mappings().one()
+        verifier = auth.decrypt(txn['verifier'])['verifier']
+        self.assertNotIn(verifier, txn['verifier'])
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b'=').decode()
+        self.assertEqual(params['code_challenge'], [challenge])
+        with patch.object(auth, 'provider_request', side_effect=self.provider) as call:
+            r = await self.client.get('/api/auth/callback', params={'state':state, 'code':'one-use-code'})
+            self.assertEqual(r.status_code, 303)
+            self.assertEqual(r.headers['location'], config.frontend_origin+'/?view=saved')
+            self.assertIn('HttpOnly', r.headers['set-cookie'])
+            self.assertIn('Secure', r.headers['set-cookie'])
+            self.assertIn('SameSite=lax', r.headers['set-cookie'])
+            self.assertNotIn('new-access', str(r.headers)+r.text)
+            call.assert_any_call('token?grant_type=pkce', None, {'auth_code':'one-use-code', 'code_verifier':verifier})
+            self.assertEqual(call.call_count, 2)
+            again = await self.client.get('/api/auth/callback', params={'state':state, 'code':'one-use-code'})
+            self.assertIn('authError', again.headers['location'])
+            self.assertEqual(call.call_count, 2)
+        async with engine.connect() as conn:
+            rows = (await conn.execute(select(auth_sessions).where(auth_sessions.c.user_id == self.uid))).mappings().all()
+            txn = (await conn.execute(select(oauth_transactions).where(oauth_transactions.c.state_hash == auth.digest(state)))).mappings().one()
+        self.assertEqual(len(rows), 1)
+        self.assertNotEqual(rows[0]['hash'], auth.digest(self.sid))
+        self.assertNotIn('new-access', rows[0]['tokens'])
+        self.assertEqual(auth.decrypt(rows[0]['tokens'])['access_token'], 'new-access')
+        self.assertIsNone(txn['verifier'])
+        self.assertIsNotNone(txn['consumed_at'])
+
+    async def test_oauth_boundaries_and_expiry(self):
+        self.assertEqual((await self.client.post('/api/auth/login/google', json={'returnTo':'https://evil.example'})).status_code, 422)
+        self.assertEqual((await self.client.post('/api/auth/login/google', json={}, headers={'Origin':'https://evil.example'})).status_code, 403)
+        self.assertEqual((await self.client.post('/api/auth/login/github', json={})).status_code, 403)
+        self.assertEqual((await self.client.post('/api/auth/session', json={'accessToken':'old'})).status_code, 404)
+        state, _ = await self.begin_login()
+        with patch.object(auth, 'provider_request') as call:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url=config.frontend_origin) as outsider:
+                r = await outsider.get('/api/auth/callback', params={'state':state,'code':'stolen'})
+                self.assertIn('authError', r.headers['location'])
+            async with engine.begin() as conn:
+                await conn.execute(update(oauth_transactions).where(oauth_transactions.c.state_hash == auth.digest(state)).values(expires_at=auth.now()-timedelta(seconds=1)))
+            r = await self.client.get('/api/auth/callback', params={'state':state,'code':'expired'})
+            self.assertIn('authError', r.headers['location'])
+            self.assertNotIn('set-cookie', r.headers)
+            call.assert_not_called()
+
+    async def test_concurrent_callback_exchanges_once(self):
+        state, _ = await self.begin_login()
+        with patch.object(auth, 'provider_request', side_effect=self.provider) as call:
+            results = await asyncio.gather(*[self.client.get('/api/auth/callback', params={'state':state,'code':'same'}) for _ in range(2)])
+            self.assertEqual(sum('view=saved' in r.headers['location'] for r in results), 1)
+            self.assertEqual(sum(c.args[0].startswith('token') for c in call.call_args_list), 1)
+
+    async def test_cancelled_oauth_preserves_session(self):
+        state, _ = await self.begin_login()
+        with patch.object(auth, 'provider_request') as call:
+            r = await self.client.get('/api/auth/callback', params={'state':state,'error':'access_denied'})
+            self.assertIn('authError', r.headers['location'])
+            self.assertNotIn('set-cookie', r.headers)
+            again = await self.client.get('/api/auth/callback', params={'state':state,'code':'late'})
+            self.assertIn('authError', again.headers['location'])
+            self.assertEqual((await self.client.get('/api/auth/me')).status_code, 200)
+            call.assert_not_called()
+
+    async def test_login_limits(self):
+        async with engine.begin() as conn:
+            await conn.execute(update(users).where(users.c.id == self.uid).values(session_window_start=auth.now(), session_issue_count=config.login_limit))
+        state, _ = await self.begin_login()
+        with patch.object(auth, 'provider_request', side_effect=self.provider):
+            r = await self.client.get('/api/auth/callback', params={'state':state, 'code':'over-limit'})
+        self.assertIn('authError', r.headers['location'])
+        self.assertNotIn('set-cookie', r.headers)
+        self.assertEqual((await self.client.get('/api/auth/me')).status_code, 200)
+        for _ in range(config.login_limit-1):
+            await self.begin_login()
+        r = await self.client.post('/api/auth/login/google', json={})
+        self.assertEqual(r.status_code, 429)
+
+    async def test_limit_and_idempotent_retry(self):
+        draft, key = 'draft_'+uuid4().hex, uuid4().hex
+        first = await self.create(draft, key)
+        self.assertEqual(first.status_code, 201, first.text)
+        self.assertEqual((await self.create(draft, key)).json(), first.json())
+        self.assertEqual((await self.create(draft)).status_code, 409)
+        self.assertEqual((await self.create()).status_code, 201)
+        results = await asyncio.gather(self.create(), self.create())
+        self.assertEqual(sorted(r.status_code for r in results), [201, 409])
+        self.assertEqual((await self.client.get('/api/trips')).json()['capacity']['savedCount'], 3)
+        self.assertEqual((await self.client.post('/api/generations', json=self.conditions())).json()['error']['code'], 'SAVED_TRIP_LIMIT_EXCEEDED')
+
+    async def test_owner_version_and_invalid_draft_preserve_original(self):
+        trip_id = (await self.create()).json()['id']
+        async with engine.begin() as conn:
+            await conn.execute(update(trips).where(trips.c.id == trip_id).values(owner_id=self.other))
+        self.assertEqual((await self.client.get('/api/trips/'+trip_id)).status_code, 404)
+        async with engine.begin() as conn:
+            await conn.execute(update(trips).where(trips.c.id == trip_id).values(owner_id=self.uid))
+        self.assertEqual((await self.client.delete('/api/trips/'+trip_id, headers={'If-Match':'2'})).status_code, 409)
+        r = await self.client.put('/api/trips/'+trip_id, json=dict(draftId='new', draftVersion=1, baseTripVersion=1), headers={'Idempotency-Key':uuid4().hex,'If-Match':'1'})
+        self.assertEqual(r.status_code, 409, r.text)
+        self.assertEqual((await self.client.get('/api/trips/'+trip_id)).json()['version'], 1)
+        self.source = trip_id
+        r = await self.client.put('/api/trips/'+trip_id, json=dict(draftId='new', draftVersion=1, baseTripVersion=1), headers={'Idempotency-Key':uuid4().hex,'If-Match':'1'})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()['version'], 2)
+
+    async def test_public_copy_hearts_and_cascade(self):
+        trip_id = (await self.create()).json()['id']
+        post_id = (await self.client.post('/api/trips/'+trip_id+'/publication')).json()['postId']
+        self.assertEqual((await self.client.post('/api/trips/'+trip_id+'/publication')).status_code, 409)
+        for _ in range(2):
+            self.assertEqual((await self.client.put('/api/posts/'+post_id+'/heart')).json()['heartCount'], 1)
+        r = await self.client.get('/api/posts/'+post_id)
+        for forbidden in ('startDate', 'email', str(self.uid), 'providerPlaceId', '2026-12-01'):
+            self.assertNotIn(forbidden, r.text)
+        name = 'Name'+uuid4().hex[:8]
+        await self.client.put('/api/users/me/nickname', json={'nickname':name})
+        self.assertEqual((await self.client.get('/api/posts/'+post_id)).json()['authorNickname'], name)
+        r = await self.client.delete('/api/trips/'+trip_id, headers={'If-Match':'1'})
+        self.assertEqual(r.status_code, 204, r.text)
+        self.assertEqual((await self.client.get('/api/posts/'+post_id)).status_code, 404)
+        async with engine.connect() as conn:
+            self.assertEqual(await conn.scalar(select(func.count()).select_from(post_hearts).where(post_hearts.c.post_id == post_id)), 0)
+
+    async def test_nickname_whitespace_and_case_sensitive(self):
+        for name in [' a', 'ab ', 'a b', 'a\tb', 'a\nb', 'a']:
+            self.assertEqual((await self.client.put('/api/users/me/nickname', json={'nickname':name})).status_code, 422)
+        name = 'Case'+uuid4().hex[:8]
+        async with engine.begin() as conn:
+            await conn.execute(update(users).where(users.c.id == self.other).values(nickname=name.lower()))
+        self.assertEqual((await self.client.put('/api/users/me/nickname', json={'nickname':name})).status_code, 200)
+        self.assertEqual((await self.client.put('/api/users/me/nickname', json={'nickname':name.lower()})).status_code, 409)
+
+    async def test_default_loader_blocks_unverified_operating_data(self):
+        app.dependency_overrides.clear()
+        self.assertEqual((await self.create()).json()['error']['code'], 'INVALID_DRAFT')
+
+    async def test_invalid_conditions_and_content(self):
+        conditions = self.conditions()
+        for change in ({'endDate':'2026-12-08'}, {'mapProvider':'naver'}, {'transportMode':'flying'}, {'party':dict(typeId='solo',sizeBand='5_plus')}):
+            r = await self.client.post('/api/generations', json={**conditions, **change})
+            self.assertEqual(r.status_code, 422, r.text)
+        body = domain.Save(draftId='draft',draftVersion=1)
+        for mutation in ('destination', 'date', 'coordinates', 'conditions', 'expiry', 'endTime', 'checkedAt'):
+            draft = self.draft(self.uid, body)
+            if mutation == 'destination': draft['content']['destination']['id'] = 'jp-osaka'
+            if mutation == 'date': draft['content']['days'][0]['date'] = '1999-01-01'
+            if mutation == 'coordinates': draft['content']['days'][0]['items'][0]['place']['latitude'] = 999
+            if mutation == 'expiry': draft['expiresAt'] = None
+            if mutation == 'endTime': draft['content']['days'][0]['items'][0]['endTime'] = '12:xx'
+            if mutation == 'checkedAt': draft['content']['days'][0]['items'][0]['place']['checkedAt'] = 'not-a-time'
+            if mutation == 'conditions': draft['content']['conditions']['party']['sizeBand'] = '6'
+            with self.assertRaises(Exception) as error:
+                domain.validate_draft(draft, self.uid, body)
+            self.assertEqual(error.exception.status_code, 409)
+
+
+if __name__ == '__main__':
+    unittest.main()
