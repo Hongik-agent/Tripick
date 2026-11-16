@@ -435,11 +435,6 @@ export default function App() {
                 여행 조건 선택하기 →
               </button>
             </section>
-            <p className="migration-notice">
-              서버 저장으로 전환했습니다. 이전 브라우저의 모의 일정은 자동
-              이전되지 않으며, 기존 자료를 일괄 삭제하지 않습니다. 처음 이용할
-              때 다시 로그인해 주세요.
-            </p>
             <section className="discover">
               <div className="section-heading">
                 <div>
