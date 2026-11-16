@@ -58,3 +58,8 @@ header{height:86px;max-width:1320px;margin:auto;display:flex;align-items:center;
   .place p,.place .reason{font-size:13px}
   .place-time,.place small,.travel-time{font-size:11px}
 }
+
+/* 서버 응답/입력 상태와 키보드 탐색 */
+.status-messages{max-width:1240px;margin:12px auto;padding:0 24px;font-size:14px}.status-messages:empty{display:none}.error-message{color:#a12d2d;background:#fff0ed;padding:12px;border-radius:8px}.migration-notice{font-size:12px;line-height:1.8;color:#65776b;margin:16px 0}.form-panel fieldset{border:0;padding:0;margin:20px 0}.form-panel details{margin:10px 0;border:1px solid #dde7dc;border-radius:8px;padding:12px}.form-panel summary{cursor:pointer}.form-panel input[type=date],.modal input{border:1px solid #ccd8cc;padding:12px;border-radius:8px;max-width:100%;width:100%;margin:8px 0 16px}.modal form{margin:20px 0}.modal .primary,.modal .secondary{margin:8px 0}.close{float:right;font-size:24px}.world-map [role=button]:focus-visible{outline:3px solid #d98e50}button:disabled{opacity:.55;cursor:not-allowed}button:focus-visible,summary:focus-visible{outline:2px solid #248d7e;outline-offset:4px}.result-grid .route-map{overflow:hidden;position:relative}.card-body{min-height:130px}
+
+@media(max-width:600px){.login-btn{font-size:12px;min-width:56px;min-height:44px}}

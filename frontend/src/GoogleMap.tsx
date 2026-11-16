@@ -15,10 +15,12 @@ let mapsPromise: Promise<GoogleMap> | undefined
 let mapsAuthFailed = false
 
 function loadGoogleMaps(key: string) {
-  if (mapsAuthFailed) return Promise.reject(new Error("Google 지도 인증에 실패했습니다."))
+  if (mapsAuthFailed)
+    return Promise.reject(new Error("Google 지도 인증에 실패했습니다."))
   if (mapsPromise) return mapsPromise
   const mapsWindow = window as MapsWindow
-  if (mapsWindow.google?.maps?.Map) return Promise.resolve(mapsWindow.google.maps.Map)
+  if (mapsWindow.google?.maps?.Map)
+    return Promise.resolve(mapsWindow.google.maps.Map)
 
   mapsPromise = new Promise<GoogleMap>((resolve, reject) => {
     const script = document.createElement("script")
@@ -48,11 +50,27 @@ function loadGoogleMaps(key: string) {
   return mapsPromise
 }
 
-export default function GoogleSeoulMap() {
+export default function GoogleMap({
+  center,
+  zoom,
+  label,
+}: {
+  center: { latitude: number; longitude: number }
+  zoom: number
+  label: string
+}) {
   const container = useRef<HTMLDivElement>(null)
   const [error, setError] = useState("")
 
   useEffect(() => {
+    setError("")
+    if (
+      !Number.isFinite(center.latitude) ||
+      !Number.isFinite(center.longitude)
+    ) {
+      setError("여행지 중심 좌표가 없습니다.")
+      return
+    }
     const key = import.meta.env.VITE_GOOGLE_MAPS_API_KEY
     if (!key) {
       setError("Google 지도 API 키가 설정되지 않았습니다.")
@@ -60,14 +78,15 @@ export default function GoogleSeoulMap() {
     }
 
     let active = true
-    const showError = () => active && setError("Google 지도를 불러오지 못했습니다.")
+    const showError = () =>
+      active && setError("Google 지도를 불러오지 못했습니다.")
     window.addEventListener("tripick-maps-error", showError)
     loadGoogleMaps(key)
       .then((Map) => {
         if (active && container.current) {
           new Map(container.current, {
-            center: { lat: 37.5665, lng: 126.978 },
-            zoom: 12,
+            center: { lat: center.latitude, lng: center.longitude },
+            zoom,
           })
         }
       })
@@ -77,13 +96,20 @@ export default function GoogleSeoulMap() {
       active = false
       window.removeEventListener("tripick-maps-error", showError)
     }
-  }, [])
+  }, [center.latitude, center.longitude, zoom])
 
   return error ? (
-    <div className="grid h-full min-h-[470px] place-items-center p-6 text-center text-sm text-red-700" role="alert">
+    <div
+      className="grid h-full min-h-[470px] place-items-center p-6 text-center text-sm text-red-700"
+      role="alert"
+    >
       {error}
     </div>
   ) : (
-    <div ref={container} className="h-full min-h-[470px] w-full" aria-label="서울 중심 Google 지도" />
+    <div
+      ref={container}
+      className="h-full min-h-[470px] w-full"
+      aria-label={`${label} 중심 Google 지도`}
+    />
   )
 }
