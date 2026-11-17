@@ -365,7 +365,7 @@ export default function App() {
           onClick={() => go("home")}
           aria-label="트리픽 홈"
         >
-          <span className="logo-mark">⌖</span>tripick
+          <img className="logo-mark" src="/tripick.svg" alt="" />Tripick
           <span className="logo-period">.</span>
         </button>
         <nav>
@@ -918,7 +918,7 @@ export default function App() {
         </main>
       )}
       <footer>
-        <span className="logo">tripick.</span>
+        <span className="logo">Tripick.</span>
         <span>나의 취향으로 채우는 여행</span>
         <small>지도 중심 좌표: GeoNames · NGA · UNT</small>
       </footer>
