@@ -69,3 +69,11 @@ header{height:86px;max-width:1320px;margin:auto;display:flex;align-items:center;
 .review-panel { display: grid; gap: 20px; }
 .review-panel h2, .review-panel .summary { margin: 0; }
 .review-panel .primary { justify-self: start; }
+.leg-button { margin: 14px 0 16px 38px; padding: 9px 15px; border-radius: 24px; background: #e8f4ee; color: #217b64; }
+.leg-dialog { margin: auto; width: min(420px, 100%); padding: 24px; border-radius: 16px; color: #263e3e; }
+.leg-dialog::backdrop { background: #183c3570; }
+.leg-dialog h2 { font-size: 20px; font-weight: 700; }
+.leg-dialog p { margin: 12px 0 20px; }
+.leg-option { display: flex; justify-content: space-between; width: 100%; margin-top: 8px; padding: 14px; border: 1px solid #dde6da; border-radius: 10px; }
+.leg-option[aria-pressed=true] { background: #e8f4ee; border-color: #248b79; font-weight: 700; }
+@media (max-width: 600px) { .leg-dialog { margin: auto auto 0; border-radius: 16px 16px 0 0; } }

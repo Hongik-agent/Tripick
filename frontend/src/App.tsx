@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react"
+import { Fragment, useEffect, useRef, useState } from "react"
 
 import {
   api,
@@ -13,6 +13,8 @@ import {
   type Post,
   type Choice,
 } from "./api"
+
+import { sampleDistances, sampleModes, sampleStops } from "./sampleItinerary"
 
 import GoogleMap from "./GoogleMap"
 
@@ -108,6 +110,12 @@ export default function App() {
 
   const [day, setDay] = useState(1)
 
+  const [selectedModes, setSelectedModes] = useState<Record<string, number>>({})
+
+  const [legIndex, setLegIndex] = useState(0)
+
+  const legDialog = useRef<HTMLDialogElement>(null)
+
   const [modal, setModal] = useState("")
 
   const [returnTo, setReturnTo] = useState("home")
@@ -199,7 +207,12 @@ export default function App() {
     void (async () => {
       try {
         const callbackParams = new URLSearchParams(location.search)
-        if (callbackParams.has("authError") || callbackParams.has("code") || callbackParams.has("error")) {
+
+        if (
+          callbackParams.has("authError") ||
+          callbackParams.has("code") ||
+          callbackParams.has("error")
+        ) {
           setError("로그인을 완료하지 못했어요. 다시 로그인해 주세요.")
           history.replaceState(null, "", location.pathname)
         }
@@ -341,18 +354,33 @@ export default function App() {
     (d) => d.id === form.destinationId,
   )
 
-  const detailDestination = trip?.destination ?? post?.destination
+  const sample = page === "sample"
 
-  const detailLabel = trip?.destination.name ?? post?.destinationName ?? ""
+  const detailDestination = sample
+    ? destination
+    : (trip?.destination ?? post?.destination)
 
-  const detailDays = trip?.days.length ?? post?.dayCount ?? 0
+  const detailLabel = sample
+    ? (destination?.label ?? "")
+    : (trip?.destination.name ?? post?.destinationName ?? "")
 
-  const items =
-    trip?.days
-      .find((d) => d.day === day)
-      ?.items.map((i) => ({ ...i.place, id: i.id, visitTime: i.startTime })) ??
-    post?.places.filter((p) => p.day === day) ??
-    []
+  const detailDays = sample
+    ? duration
+    : (trip?.days.length ?? post?.dayCount ?? 0)
+
+  const items = sample
+    ? sampleStops(destination?.countryCode, day)
+    : (trip?.days
+
+        .find((d) => d.day === day)
+
+        ?.items.map((i) => ({
+          ...i.place,
+          id: i.id,
+          visitTime: i.startTime,
+        })) ??
+      post?.places.filter((p) => p.day === day) ??
+      [])
 
   const updateForm = (key: keyof Conditions, value: string) =>
     setForm((f) => ({ ...f, [key]: value }))
@@ -365,7 +393,8 @@ export default function App() {
           onClick={() => go("home")}
           aria-label="트리픽 홈"
         >
-          <img className="logo-mark" src="/tripick.svg" alt="" />Tripick
+          <img className="logo-mark" src="/tripick.svg" alt="" />
+          Tripick
           <span className="logo-period">.</span>
         </button>
         <nav>
@@ -429,7 +458,7 @@ export default function App() {
             <section className="create-banner">
               <div>
                 <h2>여행 계획, 이제 고민 대신 설렘으로</h2>
-                <p>여행 조건을 골라 보세요. 실제 일정 생성은 준비 중입니다.</p>
+                <p>여행 조건을 골라 보세요. 샘플 일정으로 미리 볼 수 있어요.</p>
               </div>
               <button className="primary" disabled={busy} onClick={begin}>
                 여행 조건 선택하기 →
@@ -666,12 +695,6 @@ export default function App() {
                       />{" "}
                       고령자와 함께
                     </label>
-                    <Choices
-                      label="이동수단"
-                      values={options.transportModes}
-                      value={form.transportMode}
-                      onChange={(v) => updateForm("transportMode", v)}
-                    />
                   </>
                 ) : step === 3 ? (
                   <>
@@ -717,12 +740,6 @@ export default function App() {
                         options.partySizes.find(
                           (p) => p.id === form.party.sizeBand,
                         )?.label
-                      }{" "}
-                      ·{" "}
-                      {
-                        options.transportModes.find(
-                          (p) => p.id === form.transportMode,
-                        )?.label
                       }
                     </p>
                     <div className="choices">
@@ -732,27 +749,26 @@ export default function App() {
                       <button disabled>네이버 지도 (준비 안 됨)</button>
                       <button disabled>카카오맵 (준비 안 됨)</button>
                     </div>
-                    <p>실제 일정 생성은 준비 중입니다.</p>
+                    <p>
+                      샘플 일정으로 방문 순서와 구간별 이동수단을 확인해 보세요.
+                    </p>
                     <button
                       className="primary"
                       disabled={
-                        !options.generationAvailable ||
-                        busy ||
+                        !destination ||
                         duration < 1 ||
                         duration > 7 ||
                         !form.interestIds.length
                       }
-                      onClick={() =>
-                        void perform(async () => {
-                          await api("/generations", {
-                            method: "POST",
-                            headers: { "Idempotency-Key": crypto.randomUUID() },
-                            body: JSON.stringify(form),
-                          })
-                        })
-                      }
+                      onClick={() => {
+                        setSelectedModes({})
+
+                        setDay(1)
+
+                        go("sample")
+                      }}
                     >
-                      AI 일정 생성 준비 중
+                      샘플 일정 만들기
                     </button>
                   </>
                 )}
@@ -812,16 +828,27 @@ export default function App() {
             여행 조건 선택하기
           </button>
         </main>
-      ) : (page === "detail" || page === "community") && detailDestination ? (
+      ) : (sample || page === "detail" || page === "community") &&
+        detailDestination ? (
         <main className="content">
-          <button className="back" onClick={() => go(trip ? "saved" : "home")}>
-            ← 목록으로
+          <button
+            className="back"
+            onClick={() => go(sample ? "form" : trip ? "saved" : "home")}
+          >
+            ← {sample ? "여행 조건으로" : "목록으로"}
           </button>
-          <span className="eyebrow">{trip ? "MY TRIP" : "TRAVEL STORY"}</span>
+          <span className="eyebrow">
+            {sample ? "샘플 일정" : trip ? "MY TRIP" : "TRAVEL STORY"}
+          </span>
           <h1>
             {detailLabel}, {detailDays}일의 여행
           </h1>
-          {trip ? (
+          {sample ? (
+            <p>
+              {form.startDate} ~ {form.endDate} · 장소와 이동 시간·거리는
+              예시입니다.
+            </p>
+          ) : trip ? (
             <p>
               {trip.conditions.startDate} ~ {trip.conditions.endDate}
             </p>
@@ -846,18 +873,28 @@ export default function App() {
           <div className="result-grid">
             <section className="timeline">
               <h2>방문 장소</h2>
-              {items.map((item, i) => (
-                <article
-                  className="place"
-                  key={"id" in item ? item.id : item.mapPlaceId}
-                >
-                  <span className="place-number">{i + 1}</span>
-                  <div>
-                    <h3>{item.name}</h3>
-                    {"visitTime" in item && <p>{item.visitTime}</p>}
-                  </div>
-                </article>
-              ))}
+              {items.map((item, i) => {
+                const mode = sampleModes[selectedModes[day + "-" + i] ?? 0]
+                return (
+                <Fragment key={"id" in item ? item.id : item.mapPlaceId}>
+                  <article className="place">
+                    <span className="place-number">{i + 1}</span>
+                    <div>
+                      <h3>{item.name}</h3>
+                      {"visitTime" in item && <p>{item.visitTime}</p>}
+                    </div>
+                  </article>
+                    {sample && i < items.length - 1 && (
+                      <button className="leg-button" onClick={() => {
+                        setLegIndex(i)
+                        legDialog.current?.showModal()
+                      }}>
+                        <span aria-hidden="true">{mode.icon}</span> {mode.label} · {mode.minutes[i]}분 · {sampleDistances[i]}m ›
+                      </button>
+                    )}
+                </Fragment>
+                )
+              })}
               {!items.length && <p>방문 장소가 없습니다.</p>}
             </section>
             <section className="route-map">
@@ -868,11 +905,49 @@ export default function App() {
               />
             </section>
           </div>
+          {sample && (
+            <dialog
+              ref={legDialog}
+              className="leg-dialog"
+              aria-labelledby="leg-title"
+            >
+              <form method="dialog">
+                <button className="close" aria-label="닫기">
+                  ×
+                </button>
+              </form>
+              <h2 id="leg-title">이 구간 이동수단</h2>
+              <p>
+                {items[legIndex]?.name} → {items[legIndex + 1]?.name} ·{" "}
+                {sampleDistances[legIndex]}m
+              </p>
+              {sampleModes.map((mode, index) => (
+                <button
+                  key={mode.label}
+                  className="leg-option"
+                  aria-pressed={
+                    (selectedModes[day + "-" + legIndex] ?? 0) === index
+                  }
+                  onClick={() => {
+                    setSelectedModes((old) => ({
+                      ...old,
+                      [day + "-" + legIndex]: index,
+                    }))
+
+                    legDialog.current?.close()
+                  }}
+                >
+                  <span><span aria-hidden="true">{mode.icon}</span> {mode.label}</span>
+                  <span>{mode.minutes[legIndex]}분</span>
+                </button>
+              ))}
+            </dialog>
+          )}
           <p className="migration-notice">
             실제 장소 마커와 경로 표시는 후속 단계에서 제공됩니다.
           </p>
           <div className="result-actions">
-            {trip ? (
+            {sample ? null : trip ? (
               <>
                 <button className="primary" disabled={busy} onClick={publish}>
                   {trip.publishedPostId ? "게시 취소" : "일정 게시하기"}
