@@ -728,17 +728,7 @@ export default function App() {
                       <button disabled>네이버 지도 (준비 안 됨)</button>
                       <button disabled>카카오맵 (준비 안 됨)</button>
                     </div>
-                    {destination && (
-                      <GoogleMap
-                        center={destination.mapCenter}
-                        zoom={destination.mapZoom}
-                        label={destination.label ?? ""}
-                      />
-                    )}
-                    <p>
-                      지도는 여행지의 바탕 지도입니다. 실제 장소·경로를 검증하는
-                      일정 생성은 준비 중입니다.
-                    </p>
+                    <p>실제 일정 생성은 준비 중입니다.</p>
                     <button
                       className="primary"
                       disabled={
