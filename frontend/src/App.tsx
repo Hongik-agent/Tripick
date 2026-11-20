@@ -37,6 +37,16 @@ const countryLabels: Record<string, string> = {
   TH: "태국",
 }
 
+const mapProviders = [
+  { id: "google", label: "구글맵", search: "https://www.google.com/maps/search/?api=1&query=" },
+  { id: "naver", label: "네이버 지도", search: "https://map.naver.com/p/search/" },
+  { id: "kakao", label: "카카오맵", search: "https://map.kakao.com/link/search/" },
+]
+
+function providersFor(countryCode?: string) {
+  return countryCode === "KR" ? mapProviders : [mapProviders[0]]
+}
+
 const initial: Conditions = {
   optionsVersion: "v1",
   destinationId: "jp-tokyo",
@@ -364,6 +374,9 @@ export default function App() {
     ? (destination?.label ?? "")
     : (trip?.destination.name ?? post?.destinationName ?? "")
 
+  const providerId = sample ? form.mapProvider : trip?.conditions.mapProvider
+  const provider = providersFor(detailDestination?.countryCode).find((p) => p.id === providerId) ?? mapProviders[0]
+
   const detailDays = sample
     ? duration
     : (trip?.days.length ?? post?.dayCount ?? 0)
@@ -593,7 +606,7 @@ export default function App() {
                                 }
                                 aria-pressed={form.destinationId === d.id}
                                 onClick={() =>
-                                  updateForm("destinationId", d.id)
+                                  setForm((f) => ({ ...f, destinationId: d.id, mapProvider: d.countryCode === "KR" ? f.mapProvider : "google" }))
                                 }
                               >
                                 {d.label}
@@ -743,11 +756,14 @@ export default function App() {
                       }
                     </p>
                     <div className="choices">
-                      <button className="chosen" aria-pressed="true">
-                        Google Maps
-                      </button>
-                      <button disabled>네이버 지도 (준비 안 됨)</button>
-                      <button disabled>카카오맵 (준비 안 됨)</button>
+                      {providersFor(destination?.countryCode).map((p) => (
+                        <button key={p.id}
+                          className={form.mapProvider === p.id ? "chosen" : ""}
+                          aria-pressed={form.mapProvider === p.id}
+                          onClick={() => updateForm("mapProvider", p.id)}>
+                          <span aria-hidden="true">🗺️</span> {p.label}
+                        </button>
+                      ))}
                     </div>
                     <p>
                       샘플 일정으로 방문 순서와 구간별 이동수단을 확인해 보세요.
@@ -884,6 +900,7 @@ export default function App() {
                       {"visitTime" in item && <p>{item.visitTime}</p>}
                     </div>
                   </article>
+                  <div className="place-actions">
                     {sample && i < items.length - 1 && (
                       <button className="leg-button" onClick={() => {
                         setLegIndex(i)
@@ -892,6 +909,13 @@ export default function App() {
                         <span aria-hidden="true">{mode.icon}</span> {mode.label} · {mode.minutes[i]}분 · {sampleDistances[i]}m ›
                       </button>
                     )}
+                    <a className="place-map-link"
+                      href={provider.search + encodeURIComponent(detailLabel + " " + item.name)}
+                      target="_blank" rel="noopener noreferrer"
+                      aria-label={provider.label + "에서 " + item.name + " 검색 (새 창)"}>
+                      <span aria-hidden="true">🗺️</span> {provider.label}
+                    </a>
+                  </div>
                 </Fragment>
                 )
               })}

@@ -77,3 +77,8 @@ header{height:86px;max-width:1320px;margin:auto;display:flex;align-items:center;
 .leg-option { display: flex; justify-content: space-between; width: 100%; margin-top: 8px; padding: 14px; border: 1px solid #dde6da; border-radius: 10px; }
 .leg-option[aria-pressed=true] { background: #e8f4ee; border-color: #248b79; font-weight: 700; }
 @media (max-width: 600px) { .leg-dialog { margin: auto auto 0; border-radius: 16px 16px 0 0; } }
+
+.place-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 12px 0 18px; }
+.place-actions .leg-button { margin: 0; }
+.place-map-link { margin-left: auto; border: 1px solid #cbded5; border-radius: 24px; padding: 9px 12px; color: #217b64; white-space: nowrap; }
+.place-map-link:focus-visible { outline: 2px solid #248d7e; outline-offset: 3px; }
