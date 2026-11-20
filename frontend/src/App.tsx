@@ -534,7 +534,11 @@ export default function App() {
                   </button>
                 ))}
               </div>
-              <section className="form-panel">
+              <section
+                className={
+                  step === 4 ? "form-panel review-panel" : "form-panel"
+                }
+              >
                 {step === 0 ? (
                   <>
                     <h2>어디로 떠날까요?</h2>

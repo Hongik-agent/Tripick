@@ -65,3 +65,7 @@ header{height:86px;max-width:1320px;margin:auto;display:flex;align-items:center;
 @media(max-width:600px){.login-btn{font-size:12px;min-width:56px;min-height:44px}}
 
 .content > .community-empty + .primary { margin-top: 20px; }
+
+.review-panel { display: grid; gap: 20px; }
+.review-panel h2, .review-panel .summary { margin: 0; }
+.review-panel .primary { justify-self: start; }
