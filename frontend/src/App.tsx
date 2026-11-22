@@ -66,7 +66,7 @@ function providersFor(countryCode?: string) {
 const initial: Conditions & { modelId: string } = {
   modelId: "gpt-6-luna",
   optionsVersion: "v1",
-  destinationId: "jp-tokyo",
+  destinationId: "kr-seoul",
   startDate: "",
   endDate: "",
   party: {
