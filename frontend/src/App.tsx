@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState } from "react"
+import { Fragment, useCallback, useEffect, useRef, useState } from "react"
 
 import {
   api,
@@ -134,6 +134,12 @@ export default function App() {
   const [post, setPost] = useState<Post | null>(null)
 
   const [day, setDay] = useState(1)
+  const [visitSelection, setVisitSelection] = useState<{ id: string } | null>(null)
+  const mapPanel = useRef<HTMLElement>(null)
+  const selectMarker = useCallback((id: string) => {
+    setVisitSelection({ id })
+    document.getElementById("visit-" + id)?.scrollIntoView({ block: "nearest" })
+  }, [])
 
   const [legOptions, setLegOptions] = useState<Leg[]>([])
   const [legError, setLegError] = useState("")
@@ -164,6 +170,7 @@ export default function App() {
 
   const go = (value: string) => {
     submission.current?.abort()
+    setVisitSelection(null)
     setPage(value)
     setError("")
     window.scrollTo(0, 0)
@@ -397,7 +404,8 @@ export default function App() {
   const provider = providersFor(detailDestination?.countryCode).find((p) => p.id === providerId) ?? mapProviders[0]
   const detailDays = trip?.days.length ?? post?.dayCount ?? 0
   const tripPath = (draft ? "/drafts/" : "/trips/") + trip?.id
-  const items = trip?.days.find((d) => d.day === day)?.items.map((item) => ({
+  const dayItems = trip?.days.find((d) => d.day === day)?.items
+  const items = dayItems?.map((item) => ({
     ...item.place,
     id: item.id,
     googlePlaceId: item.place.providerPlaceId,
@@ -442,6 +450,7 @@ export default function App() {
         ...result, days: trip.days.map((d, i) => i === next - 1 ? result.days[i] : d),
       } : result)
     }
+    setVisitSelection(null)
     setDay(next)
   })
 
@@ -971,10 +980,19 @@ export default function App() {
                 const leg = trip?.days[day-1]?.legs[i]
                 return (
                 <Fragment key={"id" in item ? item.id : item.mapPlaceId}>
-                  <article className="place">
+                  <article id={"id" in item ? "visit-" + item.id : undefined}
+                    className={"place" + ("id" in item && visitSelection?.id === item.id ? " place-focused" : "")}>
                     <span className="place-number">{i + 1}</span>
                     <div>
-                      <h3>{item.name}</h3>
+                      <h3>{"id" in item ? (
+                        <button type="button" className="visit-select"
+                          aria-label={`${i + 1}. ${item.name} 지도에서 보기`}
+                          aria-pressed={visitSelection?.id === item.id}
+                          onClick={() => {
+                            setVisitSelection({ id: item.id })
+                            mapPanel.current?.scrollIntoView({ block: "nearest" })
+                          }}>{item.name}</button>
+                      ) : item.name}</h3>
                       {"visitTime" in item && <p>{item.visitTime}</p>}
                       {item.hoursBasis === "unknown" && <small>영업시간 확인 필요</small>}
                     </div>
@@ -1005,25 +1023,16 @@ export default function App() {
               ).join(" · ")}</p>}
               {!items.length && !freeSlots.length && <p>방문 장소가 없습니다.</p>}
             </section>
-            {!publicDetail && detailDestination && <section className="route-map">
-              {draft ? <GoogleMap
+            {!publicDetail && detailDestination && dayItems && <section className="route-map visit-map" ref={mapPanel}>
+              <p className="visit-map-legend">DAY {day} · 방문 순서</p>
+              <GoogleMap
                 center={detailDestination.mapCenter}
                 zoom={detailDestination.mapZoom}
                 label={detailLabel}
-              /> : import.meta.env.VITE_GOOGLE_MAPS_API_KEY ? (
-                <iframe
-                  className="h-full min-h-[470px] w-full"
-                  title={`${detailLabel} 중심 Google 지도`}
-                  loading="lazy"
-                  allowFullScreen
-                  referrerPolicy="strict-origin-when-cross-origin"
-                  src={`https://www.google.com/maps/embed/v1/view?${new URLSearchParams({
-                    key: import.meta.env.VITE_GOOGLE_MAPS_API_KEY,
-                    center: `${detailDestination.mapCenter.latitude},${detailDestination.mapCenter.longitude}`,
-                    zoom: String(detailDestination.mapZoom),
-                  })}`}
-                />
-              ) : <p role="alert">지금은 지도를 표시할 수 없어요.</p>}
+                items={dayItems}
+                selection={visitSelection}
+                onSelect={selectMarker}
+              />
             </section>}
           </div>
           {trip && (
@@ -1057,9 +1066,6 @@ export default function App() {
                 <button className="secondary" disabled={busy} onClick={() => showLeg(legIndex)}>다시 조회</button>}
             </dialog>
           )}
-          {!publicDetail && <p className="migration-notice">
-            실제 장소 마커와 경로 표시는 후속 단계에서 제공됩니다.
-          </p>}
           <div className="result-actions">
             {draft ? <button className="primary" disabled={busy} onClick={saveDraft}>내 일정에 저장</button> : trip ? (
               <>

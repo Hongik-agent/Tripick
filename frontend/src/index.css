@@ -95,3 +95,33 @@ header{height:86px;max-width:1320px;margin:auto;display:flex;align-items:center;
 .place-actions .leg-button { margin: 0; }
 .place-map-link { margin-left: auto; border: 1px solid #cbded5; border-radius: 24px; padding: 9px 12px; color: #217b64; white-space: nowrap; }
 .place-map-link:focus-visible { outline: 2px solid #248d7e; outline-offset: 3px; }
+
+.result-grid .place { position: relative; }
+.visit-select { color: inherit; font: inherit; text-align: left; }
+.visit-select::after { content: ""; position: absolute; inset: 0; border-radius: 10px; }
+.visit-map { display: flex; flex-direction: column; }
+.visit-map .visit-map-legend { margin: 0; padding: 10px 16px; background: white; color: #215e53; font-size: 13px; }
+.visit-map-canvas { flex: 1; min-height: 300px; width: 100%; }
+.visit-pins { position: absolute; display: flex; transform: translate(-50%, -50%); }
+.visit-pins button {
+  position: relative;
+  width: 32px; height: 32px; border: 2px solid white; border-radius: 50%;
+  background: #21796e; color: white; font: 700 14px/1 system-ui;
+  box-shadow: 0 1px 5px #0006; cursor: pointer;
+}
+.visit-pins:has([aria-pressed=true]), .visit-pins:focus-within { z-index: 1; }
+.visit-pins button[aria-pressed=true] { background: #954c12; outline: 2px solid white; }
+.visit-pins button::after {
+  content: attr(aria-label);
+  position: absolute; bottom: calc(100% + 5px); left: 50%; transform: translateX(-50%);
+  width: max-content; max-width: 13rem; padding: 5px 9px; border-radius: 6px;
+  background: #173e36; color: white; font: 600 13px/1.4 system-ui; overflow-wrap: anywhere;
+  visibility: hidden; pointer-events: none;
+}
+.visit-pins:focus-within { z-index: 2; }
+.visit-pins button:focus-visible::after { visibility: visible; }
+@media (hover: hover) {
+  .visit-pins:hover { z-index: 3; }
+  .visit-pins button:hover { box-shadow: 0 0 0 3px #173e36; }
+  .visit-pins button:hover::after { visibility: visible; }
+}
