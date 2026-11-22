@@ -71,7 +71,7 @@ def options():
         destinations=[d for key, d in DESTINATIONS.items() if key not in RETIRED_DESTINATION_IDS],
         companionTypes=choices(dict(solo='혼자', friends='친구와', partner='연인과', family='가족과')),
         partySizes=choices({'1':'1명','2':'2명','3':'3명','4':'4명','5_plus':'5명 이상'}),
-        interests=choices(INTERESTS), paces=choices(dict(relaxed='여유롭게', balanced='알차게', packed='빼곡하게')),
+        interests=choices(INTERESTS), paces=choices(dict(relaxed='여유롭게 (2곳)', balanced='알차게 (3곳)', packed='빼곡하게 (4곳)')),
         transportModes=choices(dict(walking='도보', transit='대중교통', driving='자차')))
 
 
@@ -79,8 +79,6 @@ class Party(BaseModel):
     model_config = ConfigDict(extra='forbid')
     typeId: Literal['solo','friends','partner','family']
     sizeBand: Literal['1','2','3','4','5_plus']
-    withChildren: bool = False
-    withSeniors: bool = False
 
 
 class Conditions(BaseModel):

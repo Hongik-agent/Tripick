@@ -56,8 +56,6 @@ const initial: Conditions & { modelId: string } = {
   party: {
     sizeBand: "2",
     typeId: "friends",
-    withChildren: false,
-    withSeniors: false,
   },
   interestIds: ["food"],
   paceId: "relaxed",
@@ -383,7 +381,7 @@ export default function App() {
     : (trip?.days.length ?? post?.dayCount ?? 0)
 
   const items = sample
-    ? sampleStops(destination?.countryCode, day)
+    ? sampleStops(destination?.countryCode, day, duration, form.paceId)
     : (trip?.days
 
         .find((d) => d.day === day)
@@ -677,38 +675,6 @@ export default function App() {
                         }))
                       }
                     />
-                    <label>
-                      <input
-                        type="checkbox"
-                        checked={form.party.withChildren}
-                        onChange={(e) =>
-                          setForm({
-                            ...form,
-                            party: {
-                              ...form.party,
-                              withChildren: e.target.checked,
-                            },
-                          })
-                        }
-                      />{" "}
-                      아이와 함께
-                    </label>
-                    <label>
-                      <input
-                        type="checkbox"
-                        checked={form.party.withSeniors}
-                        onChange={(e) =>
-                          setForm({
-                            ...form,
-                            party: {
-                              ...form.party,
-                              withSeniors: e.target.checked,
-                            },
-                          })
-                        }
-                      />{" "}
-                      고령자와 함께
-                    </label>
                   </>
                 ) : step === 3 ? (
                   <>

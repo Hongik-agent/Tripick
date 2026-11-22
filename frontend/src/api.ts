@@ -30,8 +30,6 @@ export type Conditions = {
   party: {
     sizeBand: string
     typeId: string
-    withChildren: boolean
-    withSeniors: boolean
   }
   interestIds: string[]
   paceId: string

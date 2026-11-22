@@ -53,7 +53,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
 
     def conditions(self):
         return dict(optionsVersion='v1', destinationId='jp-tokyo', startDate='2026-12-01', endDate='2026-12-01',
-            party=dict(typeId='friends', sizeBand='2', withChildren=False, withSeniors=False), interestIds=['food'],
+            party=dict(typeId='friends', sizeBand='2'), interestIds=['food'],
             paceId='relaxed', transportMode='walking', mapProvider='google')
 
     def draft(self, uid, body):
