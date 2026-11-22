@@ -445,12 +445,24 @@ async def nickname(body: Nickname, request: Request):
 
 def public_copy(content):
     dest = DESTINATIONS[content['conditions']['destinationId']]
-    return dict(destinationName=dest['label'], destination={k: dest[k] for k in ('id','mapCenter','mapZoom')},
+    places = []
+    for day in content['days']:
+        for index, item in enumerate(day['items']):
+            place = item['place']
+            stop = dict(mapPlaceId='place_'+uuid4().hex, day=day['day'], order=index+1,
+                        name=item.get('visitLabel') or place.get('name') or f'방문 장소 {index+1}',
+                        visitTime=item['startTime'])
+            if place.get('providerPlaceId'):
+                stop['googlePlaceId'] = place['providerPlaceId']
+            if item.get('hoursBasis') == 'unknown':
+                stop['hoursBasis'] = 'unknown'
+            if index < len(day['legs']):
+                stop['outgoingMode'] = day['legs'][index]['mode']
+            places.append(stop)
+    free_slots = {str(day['day']): day['freeSlots'] for day in content['days'] if day.get('freeSlots')}
+    return dict(destinationName=dest['label'], destination={'id': dest['id']},
         dayCount=len(content['days']), theme=' · '.join(INTERESTS[i] for i in content['conditions']['interestIds']),
-        mapProvider='google', places=[dict(mapPlaceId='place_'+uuid4().hex, day=d['day'], order=index+1,
-            name=item.get('visitLabel') or item['place']['name'],
-            **{k: item['place'][k] for k in ('latitude','longitude') if k in item['place']})
-            for d in content['days'] for index, item in enumerate(d['items'])])
+        mapProvider='google', places=places, **({'freeSlots': free_slots} if free_slots else {}))
 
 
 @router.post('/trips/{trip_id}/publication', status_code=201)
@@ -496,6 +508,9 @@ async def list_posts(request: Request, offset: int = Query(default=0, ge=0, le=1
     session = await authenticate(request, optional=True)
     async with engine.connect() as conn:
         items = await read_posts(conn, session['user_id'] if session else None, offset)
+    for item in items:
+        item['places'] = []
+        item.pop('freeSlots', None)
     return dict(items=items[:10], nextOffset=offset+10 if len(items)>10 else None)
 
 
@@ -506,7 +521,15 @@ async def post_detail(post_id: str, request: Request):
         items = await read_posts(conn, session['user_id'] if session else None, post_id=post_id)
     if not items:
         fail(404, 'RESOURCE_NOT_FOUND', '게시물을 찾을 수 없습니다.')
-    return items[0]
+    post = items[0]
+    for item in post['places']:
+        # Old public snapshots can contain only a place ID or a name and coordinates.
+        if 'providerPlaceId' in item:
+            item['googlePlaceId'] = item.pop('providerPlaceId')
+        item.setdefault('name', f"방문 장소 {item['order']}")
+        item.pop('latitude', None)
+        item.pop('longitude', None)
+    return post
 
 
 @router.put('/posts/{post_id}/heart')

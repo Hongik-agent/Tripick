@@ -67,6 +67,7 @@ header{height:86px;max-width:1320px;margin:auto;display:flex;align-items:center;
 .content > .community-empty + .primary { margin-top: 20px; }
 
 .review-panel { display: grid; gap: 20px; }
+.public-itinerary { max-width: 720px; }
 .review-panel h2, .review-panel .summary { margin: 0; }
 .generation-actions { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; }
 .generation-actions label { display: grid; gap: 6px; margin: 0; }

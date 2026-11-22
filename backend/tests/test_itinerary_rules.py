@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
-from app import generation
+from app import domain, generation
 from app.itinerary_agent import Timetable, day_slots
 from app.place_data import PlanningFailure, opening_windows
 from app.planning import Conditions
@@ -124,6 +124,27 @@ class ItineraryRules(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([v['visitLabel'] for v in items], ['2-1', '공원', '2-3', '박물관', '2-5'])
         self.assertLess(items[1]['startTime'], '12:00')
         self.assertGreaterEqual(items[3]['startTime'], '14:00')
+
+    async def test_unknown_venue_and_meal_hours_are_advisory_through_publication(self):
+        result, calls = await self.generate(unknown={'1-1', '1-2'})
+        self.assertEqual(calls, 2)
+        self.assertEqual([(v['visitLabel'], v['hoursBasis']) for v in result['days'][0]['items'][:2]],
+                         [('1-1', 'unknown'), ('1-2', 'unknown')])
+        public = domain.public_copy(result)
+        self.assertEqual([(v['name'], v['hoursBasis']) for v in public['places'][:2]],
+                         [('1-1', 'unknown'), ('1-2', 'unknown')])
+
+    async def test_closed_day_leaves_free_slots_and_rest_of_trip_is_savable(self):
+        result, calls = await self.generate(closed={'1-1', '1-1대안', '1-2', '1-3', '1-4'})
+        first = result['days'][0]
+        self.assertEqual((first['items'], first['legs']), ([], []))
+        self.assertCountEqual(first['freeSlots'], ['activity', 'meal', 'activity', 'meal'])
+        self.assertEqual(calls, 2)
+        draft = dict(ownerId='u', version=1, status='success', expiresAt=domain.now()+timedelta(hours=1), content=result)
+        saved = domain.validate_draft(draft, 'u', domain.Save(draftId='draft', draftVersion=1))
+        public = domain.public_copy(saved)
+        self.assertEqual(public['freeSlots']['1'], first['freeSlots'])
+        self.assertTrue(all(p['day'] > 1 for p in public['places']))
 
     async def test_closed_stop_with_unreachable_backup_reconnects_remaining_visits(self):
         result, _ = await self.generate(closed={'1-2'}, no_walk={('1-2대안','1-3'), ('1-2대안','1-1')})

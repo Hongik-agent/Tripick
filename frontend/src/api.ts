@@ -79,19 +79,23 @@ export type Trip = {
 }
 
 export type Post = {
+  storage?: string
   id: string
   authorNickname: string
   destinationName: string
-  destination: Destination
+  destination: Pick<Destination, "id">
   dayCount: number
   theme: string
+  freeSlots?: Record<string, Day["freeSlots"]>
   places: {
     mapPlaceId: string
     day: number
     order: number
     name: string
-    latitude: number
-    longitude: number
+    visitTime?: string
+    hoursBasis?: string
+    googlePlaceId?: string
+    outgoingMode?: "walking" | "transit" | "driving"
   }[]
   heartCount: number
   heartedByMe: boolean

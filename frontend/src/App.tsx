@@ -390,7 +390,8 @@ export default function App() {
   )
 
   const draft = page === "draft"
-  const detailDestination = trip?.destination ?? post?.destination
+  const publicDetail = page === "community"
+  const detailDestination = trip?.destination
   const detailLabel = trip?.destination.name ?? post?.destinationName ?? ""
   const providerId = draft ? form.mapProvider : trip?.conditions.mapProvider
   const provider = providersFor(detailDestination?.countryCode).find((p) => p.id === providerId) ?? mapProviders[0]
@@ -403,7 +404,7 @@ export default function App() {
     visitTime: item.startTime,
     hoursBasis: item.hoursBasis,
   })) ?? post?.places.filter((p) => p.day === day) ?? []
-  const freeSlots = trip?.days[day - 1]?.freeSlots ?? []
+  const freeSlots = trip?.days[day - 1]?.freeSlots ?? post?.freeSlots?.[day] ?? []
 
   const submitGeneration = () => void perform(async () => {
     // The selected link provider is a UI preference. The backend verifies places with Google.
@@ -926,7 +927,7 @@ export default function App() {
           </button>
         </main>
       ) : (draft || page === "detail" || page === "community") &&
-        detailDestination ? (
+        (detailDestination || (publicDetail && post)) ? (
         <main className="content">
           <button
             className="back"
@@ -963,7 +964,7 @@ export default function App() {
               ))}
             </div>
           </div>
-          <div className="result-grid">
+          <div className={publicDetail ? "public-itinerary" : "result-grid"}>
             <section className="timeline">
               <h2>방문 장소</h2>
               {items.map((item, i) => {
@@ -975,10 +976,13 @@ export default function App() {
                     <div>
                       <h3>{item.name}</h3>
                       {"visitTime" in item && <p>{item.visitTime}</p>}
-                      {"hoursBasis" in item && item.hoursBasis === "unknown" && <small>영업시간 확인 필요</small>}
+                      {item.hoursBasis === "unknown" && <small>영업시간 확인 필요</small>}
                     </div>
                   </article>
                   <div className="place-actions">
+                    {"outgoingMode" in item && item.outgoingMode && (
+                      <span>{{ walking: "🚶 도보", transit: "🚇 대중교통", driving: "🚗 자동차" }[item.outgoingMode]}</span>
+                    )}
                     {leg && (
                       <button className="leg-button" disabled={busy} onClick={() => showLeg(i)}>
                         {modeLabels[leg.mode]} · {leg.status === "verified"
@@ -987,7 +991,7 @@ export default function App() {
                     )}
                     <a className="place-map-link"
                       href={provider.search + encodeURIComponent(detailLabel + " " + item.name) +
-                        (provider.id === "google" && "googlePlaceId" in item && item.googlePlaceId ? "&query_place_id=" + encodeURIComponent(item.googlePlaceId) : "")}
+                        (provider.id === "google" && item.googlePlaceId ? "&query_place_id=" + encodeURIComponent(item.googlePlaceId) : "")}
                       target="_blank" rel="noopener noreferrer"
                       aria-label={provider.label + "에서 " + item.name + " 검색 (새 창)"}>
                       <span aria-hidden="true">🗺️</span> {provider.label}
@@ -1001,8 +1005,8 @@ export default function App() {
               ).join(" · ")}</p>}
               {!items.length && !freeSlots.length && <p>방문 장소가 없습니다.</p>}
             </section>
-            {detailDestination && <section className="route-map">
-              {draft || !trip ? <GoogleMap
+            {!publicDetail && detailDestination && <section className="route-map">
+              {draft ? <GoogleMap
                 center={detailDestination.mapCenter}
                 zoom={detailDestination.mapZoom}
                 label={detailLabel}
@@ -1053,9 +1057,9 @@ export default function App() {
                 <button className="secondary" disabled={busy} onClick={() => showLeg(legIndex)}>다시 조회</button>}
             </dialog>
           )}
-          <p className="migration-notice">
+          {!publicDetail && <p className="migration-notice">
             실제 장소 마커와 경로 표시는 후속 단계에서 제공됩니다.
-          </p>
+          </p>}
           <div className="result-actions">
             {draft ? <button className="primary" disabled={busy} onClick={saveDraft}>내 일정에 저장</button> : trip ? (
               <>

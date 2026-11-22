@@ -295,6 +295,9 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(2):
             self.assertEqual((await self.client.put('/api/posts/'+post_id+'/heart')).json()['heartCount'], 1)
         r = await self.client.get('/api/posts/'+post_id)
+        self.assertEqual(r.json()['places'][0]['visitTime'], '10:00')
+        self.assertEqual(r.json()['places'][0]['googlePlaceId'], 'test-place')
+        self.assertNotIn('latitude', r.json()['places'][0])
         for forbidden in ('startDate', 'email', str(self.uid), 'providerPlaceId', '2026-12-01'):
             self.assertNotIn(forbidden, r.text)
         name = 'Name'+uuid4().hex[:8]
