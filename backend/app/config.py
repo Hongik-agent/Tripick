@@ -58,3 +58,6 @@ if session_touch_seconds >= session_idle_seconds or session_idle_seconds > sessi
     raise ValueError("Require touch < idle <= absolute session timeout")
 cors_methods = ["GET", "POST", "PUT", "DELETE"]
 cors_headers = ["Content-Type", "X-CSRF-Token", "Idempotency-Key", "If-Match"]
+
+openai_key = os.getenv("OPENAI_API_KEY", "")
+maps_key = os.getenv("GOOGLE_MAPS_API_KEY", "")
