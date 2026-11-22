@@ -47,7 +47,8 @@ function providersFor(countryCode?: string) {
   return countryCode === "KR" ? mapProviders : [mapProviders[0]]
 }
 
-const initial: Conditions = {
+const initial: Conditions & { modelId: string } = {
+  modelId: "gpt-6-luna",
   optionsVersion: "v1",
   destinationId: "jp-tokyo",
   startDate: "",
@@ -768,24 +769,37 @@ export default function App() {
                     <p>
                       샘플 일정으로 방문 순서와 구간별 이동수단을 확인해 보세요.
                     </p>
-                    <button
-                      className="primary"
-                      disabled={
-                        !destination ||
-                        duration < 1 ||
-                        duration > 7 ||
-                        !form.interestIds.length
-                      }
-                      onClick={() => {
-                        setSelectedModes({})
+                    <div className="generation-actions">
+                      <label>
+                        일정 생성 모델
+                        <select
+                          value={form.modelId ?? initial.modelId}
+                          onChange={(e) => updateForm("modelId", e.target.value)}
+                        >
+                          <option value="gpt-6-luna">GPT-6 Luna</option>
+                          <option value="gpt-6.1-terra">GPT-6.1 Terra</option>
+                        </select>
+                        <span className="model-check" aria-hidden="true">✓</span>
+                      </label>
+                      <button
+                        className="primary"
+                        disabled={
+                          !destination ||
+                          duration < 1 ||
+                          duration > 7 ||
+                          !form.interestIds.length
+                        }
+                        onClick={() => {
+                          setSelectedModes({})
 
-                        setDay(1)
+                          setDay(1)
 
-                        go("sample")
-                      }}
-                    >
-                      샘플 일정 만들기
-                    </button>
+                          go("sample")
+                        }}
+                      >
+                        샘플 일정 만들기
+                      </button>
+                    </div>
                   </>
                 )}
               </section>

@@ -3,6 +3,10 @@ from sqlalchemy import Column, DateTime, MetaData, String, Table, Uuid, func, Fo
 
 metadata = MetaData()
 
+generation_models = Table("generation_models", metadata,
+    Column("id", Text, primary_key=True),
+)
+
 oauth_transactions = Table("oauth_transactions", metadata,
     Column("state_hash", String(64), primary_key=True),
     Column("browser_hash", String(64), nullable=False, index=True),

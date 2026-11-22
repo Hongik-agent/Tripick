@@ -22,6 +22,7 @@ export type Options = {
 }
 
 export type Conditions = {
+  modelId?: string
   optionsVersion: string
   destinationId: string
   startDate: string
