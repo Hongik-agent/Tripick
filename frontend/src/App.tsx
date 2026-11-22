@@ -5,6 +5,9 @@ import {
   ApiError,
   clearAuth,
   restoreAuth,
+  generateDraft,
+  GenerationFailed,
+  type GenerationProgress,
   type User,
   type Options,
   type Conditions,
@@ -13,8 +16,6 @@ import {
   type Post,
   type Choice,
 } from "./api"
-
-import { sampleDistances, sampleModes, sampleStops } from "./sampleItinerary"
 
 import GoogleMap from "./GoogleMap"
 
@@ -42,6 +43,20 @@ const mapProviders = [
   { id: "naver", label: "네이버 지도", search: "https://map.naver.com/p/search/" },
   { id: "kakao", label: "카카오맵", search: "https://map.kakao.com/link/search/" },
 ]
+
+const modeLabels: Record<string, string> = { walking: "🚶 도보", transit: "🚇 대중교통", driving: "🚗 자동차" }
+
+const progressLabels: Record<GenerationProgress["stage"], string> = {
+  submitting: "생성 요청을 보내는 중",
+  queued: "생성 요청 접수 완료",
+  running: "일정을 생성하는 중",
+  planning: "방문 후보를 고르는 중",
+  checking: "영업시간과 도보 경로를 확인하는 중",
+  scheduling: "방문 시각을 조정하는 중",
+  verifying: "방문 시간과 동선을 최종 확인하는 중",
+  repairing: "방문지를 교체하는 중",
+  completed: "생성 완료 · 일정을 여는 중",
+}
 
 function providersFor(countryCode?: string) {
   return countryCode === "KR" ? mapProviders : [mapProviders[0]]
@@ -119,11 +134,12 @@ export default function App() {
 
   const [day, setDay] = useState(1)
 
-  const [selectedModes, setSelectedModes] = useState<Record<string, number>>({})
+  const [progress, setProgress] = useState<GenerationProgress | null>(null)
+  const generating = progress !== null
+  const generationRequest = useRef<{ body: string; key: string } | null>(null)
+  const submission = useRef<AbortController | null>(null)
 
-  const [legIndex, setLegIndex] = useState(0)
 
-  const legDialog = useRef<HTMLDialogElement>(null)
 
   const [modal, setModal] = useState("")
 
@@ -142,6 +158,7 @@ export default function App() {
   const sessionEpoch = useRef(0)
 
   const go = (value: string) => {
+    submission.current?.abort()
     setPage(value)
     setError("")
     window.scrollTo(0, 0)
@@ -158,7 +175,7 @@ export default function App() {
     try {
       await action()
     } catch (e) {
-      setError(e instanceof Error ? e.message : "요청을 완료하지 못했어요.")
+      setError(e instanceof ApiError ? e.message : "요청을 완료하지 못했어요.")
     } finally {
       busyRef.current = false
       setBusy(false)
@@ -198,6 +215,8 @@ export default function App() {
     let active = true
 
     const expired = () => {
+      submission.current?.abort()
+      generationRequest.current = null
       sessionEpoch.current++
 
       clearAuth()
@@ -249,7 +268,7 @@ export default function App() {
         }
       } catch (e) {
         if (active && !(e instanceof ApiError && e.status === 401))
-          setError(e instanceof Error ? e.message : "로그인 상태 확인 실패")
+          setError(e instanceof ApiError ? e.message : "로그인 상태 확인 실패")
       } finally {
         if (active) {
           setAuthReady(true)
@@ -257,13 +276,14 @@ export default function App() {
           try {
             await refreshPosts()
           } catch (e) {
-            setError(e instanceof Error ? e.message : "게시물 조회 실패")
+            setError(e instanceof ApiError ? e.message : "게시물 조회 실패")
           }
         }
       }
     })()
 
     return () => {
+      submission.current?.abort()
       active = false
       window.removeEventListener("tripick-auth-expired", expired)
     }
@@ -286,6 +306,7 @@ export default function App() {
 
     void perform(async () => {
       setOptions(await api<Options>("/planning-options"))
+      generationRequest.current = null
       setForm(initial)
       setStep(0)
       go("form")
@@ -363,39 +384,88 @@ export default function App() {
     (d) => d.id === form.destinationId,
   )
 
-  const sample = page === "sample"
-
-  const detailDestination = sample
-    ? destination
-    : (trip?.destination ?? post?.destination)
-
-  const detailLabel = sample
-    ? (destination?.label ?? "")
-    : (trip?.destination.name ?? post?.destinationName ?? "")
-
-  const providerId = sample ? form.mapProvider : trip?.conditions.mapProvider
+  const draft = page === "draft"
+  const detailDestination = trip?.destination ?? post?.destination
+  const detailLabel = trip?.destination.name ?? post?.destinationName ?? ""
+  const providerId = draft ? form.mapProvider : trip?.conditions.mapProvider
   const provider = providersFor(detailDestination?.countryCode).find((p) => p.id === providerId) ?? mapProviders[0]
+  const detailDays = trip?.days.length ?? post?.dayCount ?? 0
+  const tripPath = (draft ? "/drafts/" : "/trips/") + trip?.id
+  const items = trip?.days.find((d) => d.day === day)?.items.map((item) => ({
+    ...item.place,
+    id: item.id,
+    googlePlaceId: item.place.providerPlaceId,
+    visitTime: item.startTime,
+    hoursBasis: item.hoursBasis,
+  })) ?? post?.places.filter((p) => p.day === day) ?? []
+  const freeSlots = trip?.days[day - 1]?.freeSlots ?? []
 
-  const detailDays = sample
-    ? duration
-    : (trip?.days.length ?? post?.dayCount ?? 0)
+  const submitGeneration = () => void perform(async () => {
+    // The selected link provider is a UI preference. The backend verifies places with Google.
+    const conditions = { ...form, mapProvider: "google" }
+    const body = JSON.stringify(conditions)
+    if (generationRequest.current?.body !== body)
+      generationRequest.current = { body, key: crypto.randomUUID() }
+    const controller = new AbortController()
+    submission.current = controller
+    setProgress({ stage: "submitting" })
+    try {
+      const result = await generateDraft(conditions, generationRequest.current.key, controller.signal, setProgress)
+      if (controller.signal.aborted) return
+      setTrip(result)
+      setPost(null)
+      setDay(1)
+      go("draft")
+      generationRequest.current = null
+    } catch (e) {
+      if (e instanceof GenerationFailed || (e instanceof ApiError && e.code === "INVALID_DRAFT"))
+        generationRequest.current = null
+      if (!controller.signal.aborted) throw e
+    } finally {
+      submission.current = null
+      setProgress(null)
+    }
+  })
 
-  const items = sample
-    ? sampleStops(destination?.countryCode, day, duration, form.paceId)
-    : (trip?.days
+  const selectDay = (next: number) => void perform(async () => {
+    if (next === day) return
+    const nextDay = trip?.days[next - 1]
+    if (trip?.storage === "place_ids" && nextDay && !nextDay.items.length && !nextDay.freeSlots?.length) {
+      const result = await api<Trip>(tripPath + "?day=" + next)
+      setTrip(result.version === trip.version ? {
+        ...result, days: trip.days.map((d, i) => i === next - 1 ? result.days[i] : d),
+      } : result)
+    }
+    setDay(next)
+  })
 
-        .find((d) => d.day === day)
-
-        ?.items.map((i) => ({
-          ...i.place,
-          id: i.id,
-          visitTime: i.startTime,
-        })) ??
-      post?.places.filter((p) => p.day === day) ??
-      [])
+  const saveDraft = () => void perform(async () => {
+    if (!trip || !draft) return
+    const source = trip.conditions.sourceTripId
+    const baseTripVersion = trip.conditions.baseTripVersion
+    const headers: Record<string, string> = { "Idempotency-Key": trip.id + "_" + trip.version }
+    if (source) headers["If-Match"] = String(baseTripVersion)
+    const result = await api<{id: string; version: number}>(source ? "/trips/"+source : "/trips", {
+      method: source ? "PUT" : "POST", headers,
+      body: JSON.stringify({draftId: trip.id, draftVersion: trip.version, baseTripVersion}),
+    })
+    setTrip({ ...trip, id: result.id, version: result.version,
+      publishedPostId: saved.find((item) => item.id === source)?.publishedPostId ?? null })
+    go("detail")
+    setNotice("내 일정에 저장했어요.")
+    await refreshSaved()
+  })
 
   const updateForm = (key: keyof Conditions, value: string) =>
     setForm((f) => ({ ...f, [key]: value }))
+
+  const review = page === "form" && step === 4 && !!options && !modal
+  const errorAlert = error && (
+    <p role="alert" className="error-message">
+      {error}{" "}
+      <button onClick={() => setError("")} aria-label="오류 안내 닫기">×</button>
+    </p>
+  )
 
   return (
     <div className="app">
@@ -445,14 +515,7 @@ export default function App() {
         </button>
       </header>
       <div className="status-messages" aria-live="polite">
-        {error && (
-          <p role="alert" className="error-message">
-            {error}{" "}
-            <button onClick={() => setError("")} aria-label="오류 안내 닫기">
-              ×
-            </button>
-          </p>
-        )}
+        {!review && !modal && errorAlert}
         {notice && <p>{notice}</p>}
       </div>
       {page === "home" ? (
@@ -470,7 +533,7 @@ export default function App() {
             <section className="create-banner">
               <div>
                 <h2>여행 계획, 이제 고민 대신 설렘으로</h2>
-                <p>여행 조건을 골라 보세요. 샘플 일정으로 미리 볼 수 있어요.</p>
+                <p>여행 조건을 고르면 AI가 일정을 만들어요.</p>
               </div>
               <button className="primary" disabled={busy} onClick={begin}>
                 여행 조건 선택하기 →
@@ -567,6 +630,7 @@ export default function App() {
                 ].map((label, i) => (
                   <button
                     key={label}
+                    disabled={generating}
                     className={step === i ? "active" : ""}
                     onClick={() => setStep(i)}
                   >
@@ -725,6 +789,7 @@ export default function App() {
                     <div className="choices">
                       {providersFor(destination?.countryCode).map((p) => (
                         <button key={p.id}
+                          disabled={generating}
                           className={form.mapProvider === p.id ? "chosen" : ""}
                           aria-pressed={form.mapProvider === p.id}
                           onClick={() => updateForm("mapProvider", p.id)}>
@@ -732,13 +797,12 @@ export default function App() {
                         </button>
                       ))}
                     </div>
-                    <p>
-                      샘플 일정으로 방문 순서와 구간별 이동수단을 확인해 보세요.
-                    </p>
+                    {!options.generationAvailable && <p role="status">지금은 AI 일정 생성을 이용할 수 없어요.</p>}
                     <div className="generation-actions">
                       <label>
                         일정 생성 모델
                         <select
+                          disabled={generating}
                           value={form.modelId ?? initial.modelId}
                           onChange={(e) => updateForm("modelId", e.target.value)}
                         >
@@ -749,23 +813,25 @@ export default function App() {
                       </label>
                       <button
                         className="primary"
-                        disabled={
-                          !destination ||
-                          duration < 1 ||
-                          duration > 7 ||
-                          !form.interestIds.length
-                        }
-                        onClick={() => {
-                          setSelectedModes({})
-
-                          setDay(1)
-
-                          go("sample")
-                        }}
+                        disabled={busy || !options.generationAvailable || !destination || duration < 1 ||
+                          duration > 7 || !form.interestIds.length}
+                        onClick={submitGeneration}
                       >
-                        샘플 일정 만들기
+                        {generating ? "AI 일정 생성 중…" : "AI 일정 생성"}
                       </button>
                     </div>
+                    {progress && (
+                      <div className="generation-progress">
+                        <div>
+                          <span role="status" id="generation-stage">
+                            {progress.day && `${progress.day}일차 · `}{progressLabels[progress.stage]}
+                          </span>
+                          {progress.percent !== undefined && <strong aria-hidden="true">{progress.percent}%</strong>}
+                        </div>
+                        <progress aria-labelledby="generation-stage" max={100} value={progress.percent} />
+                      </div>
+                    )}
+                    {review && errorAlert}
                   </>
                 )}
               </section>
@@ -773,6 +839,7 @@ export default function App() {
                 {step > 0 && (
                   <button
                     className="secondary"
+                    disabled={generating}
                     onClick={() => setStep(step - 1)}
                   >
                     이전
@@ -824,27 +891,22 @@ export default function App() {
             여행 조건 선택하기
           </button>
         </main>
-      ) : (sample || page === "detail" || page === "community") &&
+      ) : (draft || page === "detail" || page === "community") &&
         detailDestination ? (
         <main className="content">
           <button
             className="back"
-            onClick={() => go(sample ? "form" : trip ? "saved" : "home")}
+            onClick={() => go(draft ? "form" : trip ? "saved" : "home")}
           >
-            ← {sample ? "여행 조건으로" : "목록으로"}
+            ← {draft ? "여행 조건으로" : "목록으로"}
           </button>
           <span className="eyebrow">
-            {sample ? "샘플 일정" : trip ? "MY TRIP" : "TRAVEL STORY"}
+            {draft ? "AI 생성 일정" : trip ? "MY TRIP" : "TRAVEL STORY"}
           </span>
           <h1>
             {detailLabel}, {detailDays}일의 여행
           </h1>
-          {sample ? (
-            <p>
-              {form.startDate} ~ {form.endDate} · 장소와 이동 시간·거리는
-              예시입니다.
-            </p>
-          ) : trip ? (
+          {trip ? (
             <p>
               {trip.conditions.startDate} ~ {trip.conditions.endDate}
             </p>
@@ -859,7 +921,8 @@ export default function App() {
                 <button
                   key={i}
                   className={day === i + 1 ? "chosen" : ""}
-                  onClick={() => setDay(i + 1)}
+                  disabled={busy}
+                  onClick={() => selectDay(i + 1)}
                 >
                   DAY {i + 1}
                 </button>
@@ -870,7 +933,7 @@ export default function App() {
             <section className="timeline">
               <h2>방문 장소</h2>
               {items.map((item, i) => {
-                const mode = sampleModes[selectedModes[day + "-" + i] ?? 0]
+                const leg = trip?.days[day-1]?.legs[i]
                 return (
                 <Fragment key={"id" in item ? item.id : item.mapPlaceId}>
                   <article className="place">
@@ -878,19 +941,19 @@ export default function App() {
                     <div>
                       <h3>{item.name}</h3>
                       {"visitTime" in item && <p>{item.visitTime}</p>}
+                      {"hoursBasis" in item && item.hoursBasis === "unknown" && <small>영업시간 확인 필요</small>}
                     </div>
                   </article>
                   <div className="place-actions">
-                    {sample && i < items.length - 1 && (
-                      <button className="leg-button" onClick={() => {
-                        setLegIndex(i)
-                        legDialog.current?.showModal()
-                      }}>
-                        <span aria-hidden="true">{mode.icon}</span> {mode.label} · {mode.minutes[i]}분 · {sampleDistances[i]}m ›
-                      </button>
+                    {leg && (
+                      <span className="leg-button">
+                        {modeLabels[leg.mode]} · {leg.status === "verified"
+                          ? `${leg.durationMinutes}분 · ${leg.distanceMeters}m` : "경로 확인"}
+                      </span>
                     )}
                     <a className="place-map-link"
-                      href={provider.search + encodeURIComponent(detailLabel + " " + item.name)}
+                      href={provider.search + encodeURIComponent(detailLabel + " " + item.name) +
+                        (provider.id === "google" && "googlePlaceId" in item && item.googlePlaceId ? "&query_place_id=" + encodeURIComponent(item.googlePlaceId) : "")}
                       target="_blank" rel="noopener noreferrer"
                       aria-label={provider.label + "에서 " + item.name + " 검색 (새 창)"}>
                       <span aria-hidden="true">🗺️</span> {provider.label}
@@ -899,69 +962,39 @@ export default function App() {
                 </Fragment>
                 )
               })}
-              {!items.length && <p>방문 장소가 없습니다.</p>}
+              {freeSlots.length > 0 && <p>현지에서 자유롭게 정해 주세요 · {freeSlots.map(slot =>
+                ({ breakfast: "아침 식사", lunch: "점심 식사", dinner: "저녁 식사", meal: "식사", activity: "관광" })[slot]
+              ).join(" · ")}</p>}
+              {!items.length && !freeSlots.length && <p>방문 장소가 없습니다.</p>}
             </section>
-            <section className="route-map">
+            {detailDestination && <section className="route-map">
               <GoogleMap
                 center={detailDestination.mapCenter}
                 zoom={detailDestination.mapZoom}
                 label={detailLabel}
               />
-            </section>
+            </section>}
           </div>
-          {sample && (
-            <dialog
-              ref={legDialog}
-              className="leg-dialog"
-              aria-labelledby="leg-title"
-            >
-              <form method="dialog">
-                <button className="close" aria-label="닫기">
-                  ×
-                </button>
-              </form>
-              <h2 id="leg-title">이 구간 이동수단</h2>
-              <p>
-                {items[legIndex]?.name} → {items[legIndex + 1]?.name} ·{" "}
-                {sampleDistances[legIndex]}m
-              </p>
-              {sampleModes.map((mode, index) => (
-                <button
-                  key={mode.label}
-                  className="leg-option"
-                  aria-pressed={
-                    (selectedModes[day + "-" + legIndex] ?? 0) === index
-                  }
-                  onClick={() => {
-                    setSelectedModes((old) => ({
-                      ...old,
-                      [day + "-" + legIndex]: index,
-                    }))
-
-                    legDialog.current?.close()
-                  }}
-                >
-                  <span><span aria-hidden="true">{mode.icon}</span> {mode.label}</span>
-                  <span>{mode.minutes[legIndex]}분</span>
-                </button>
-              ))}
-            </dialog>
-          )}
           <p className="migration-notice">
             실제 장소 마커와 경로 표시는 후속 단계에서 제공됩니다.
           </p>
           <div className="result-actions">
-            {sample ? null : trip ? (
+            {draft ? <button className="primary" disabled={busy} onClick={saveDraft}>내 일정에 저장</button> : trip ? (
               <>
                 <button className="primary" disabled={busy} onClick={publish}>
                   {trip.publishedPostId ? "게시 취소" : "일정 게시하기"}
                 </button>
                 <button
                   className="secondary"
-                  disabled
-                  title="실제 장소·경로 검증 연동 후 제공"
+                  disabled={busy}
+                  onClick={() => void perform(async () => {
+                    setOptions(await api<Options>("/planning-options"))
+                    setForm({...trip.conditions, sourceTripId:trip.id, baseTripVersion:trip.version})
+                    setStep(4)
+                    go("form")
+                  })}
                 >
-                  편집·재생성 준비 중
+                  AI 일정 재생성
                 </button>
                 <button className="text-btn" onClick={() => setModal("delete")}>
                   일정 삭제
