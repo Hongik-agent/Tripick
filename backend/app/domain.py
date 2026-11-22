@@ -2,8 +2,10 @@ import hashlib
 import json
 import re
 import math
+import asyncio
 from datetime import timedelta, datetime, time, timezone
 from uuid import uuid4
+from urllib.parse import quote
 from typing import Literal
 from copy import deepcopy
 
@@ -24,6 +26,7 @@ from .models import users, trips, posts, post_hearts as hearts, idempotency_keys
 from .planning import Conditions, options, DESTINATIONS, INTERESTS
 from . import config, generation
 from .models import generation_jobs as jobs, generation_requests as counters
+from .place_data import GooglePlaces, PlanningFailure
 from .route_options import GOOGLE_MODES, route_choices, route_option
 
 router = APIRouter(prefix='/api')
@@ -522,6 +525,7 @@ async def post_detail(post_id: str, request: Request):
     if not items:
         fail(404, 'RESOURCE_NOT_FOUND', '게시물을 찾을 수 없습니다.')
     post = items[0]
+    post['publicMapAvailable'] = bool(config.maps_key)
     for item in post['places']:
         # Old public snapshots can contain only a place ID or a name and coordinates.
         if 'providerPlaceId' in item:
@@ -530,6 +534,40 @@ async def post_detail(post_id: str, request: Request):
         item.pop('latitude', None)
         item.pop('longitude', None)
     return post
+
+
+@router.get('/posts/{post_id}/map')
+async def public_day_map(post_id: str, day: int = Query(ge=1, le=7)):
+    unavailable = {'available': False}
+    if not config.maps_key:
+        return unavailable
+    async with engine.connect() as conn:
+        content = await conn.scalar(select(posts.c.content).where(posts.c.id == post_id))
+        if content is None:
+            fail(404, 'RESOURCE_NOT_FOUND', '게시물을 찾을 수 없습니다.')
+        destination = DESTINATIONS.get(content.get('destination', {}).get('id'))
+        stops = [p for p in content['places'] if p['day'] == day]
+        ids = [p.get('googlePlaceId') or p.get('providerPlaceId') for p in stops]
+        unique = list(dict.fromkeys(pid for pid in ids if pid))
+        if not destination or not unique:
+            return unavailable
+
+    async with httpx.AsyncClient() as client:
+        google = GooglePlaces(client, config.maps_key)
+        async def location(pid):
+            try:
+                data = await google.request('GET', 'places/' + quote(pid, safe=''), 'location,attributions')
+            except PlanningFailure:
+                return None
+            coords = data.get('location', {})
+            if not all(isinstance(coords.get(k), (float, int)) and math.isfinite(coords[k])
+                       for k in ('latitude', 'longitude')):
+                return None
+            return {**coords, 'attributions': data.get('attributions', [])}
+        coordinates = dict(zip(unique, await asyncio.gather(*(location(pid) for pid in unique))))
+    items = [dict(id=p['mapPlaceId'], order=i, place=dict(name=p.get('name') or f'방문 장소 {i}', **coordinates[pid]))
+             for i, (p, pid) in enumerate(zip(stops, ids), 1) if coordinates.get(pid)]
+    return dict(available=True, center=destination['mapCenter'], zoom=destination['mapZoom'], items=items)
 
 
 @router.put('/posts/{post_id}/heart')

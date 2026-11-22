@@ -309,6 +309,24 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         async with engine.connect() as conn:
             self.assertEqual(await conn.scalar(select(func.count()).select_from(post_hearts).where(post_hearts.c.post_id == post_id)), 0)
 
+    async def test_public_map_shares_repeated_place_lookup_and_skips_missing_ids(self):
+        trip_id = (await self.create()).json()['id']
+        post_id = (await self.client.post('/api/trips/'+trip_id+'/publication')).json()['postId']
+        url = '/api/posts/'+post_id+'/map?day=1'
+        async with engine.begin() as conn:
+            content = await conn.scalar(select(posts.c.content).where(posts.c.id == post_id))
+            first = content['places'][0]
+            content['places'].extend([dict(mapPlaceId='unknown', order=2, day=1, name='미확인'),
+                                      dict(first, mapPlaceId='again', order=3)])
+            await conn.execute(update(posts).where(posts.c.id == post_id).values(content=content))
+        with patch.object(config, 'maps_key', 'test'), patch.object(domain.GooglePlaces, 'request',
+                    return_value={'location': {'latitude': 35, 'longitude': 139}}) as lookup:
+            self.assertFalse((await self.client.get(url.replace('day=1', 'day=2'))).json()['available'])
+            lookup.assert_not_called()
+            result = (await self.client.get(url)).json()
+            self.assertEqual([p['order'] for p in result['items']], [1, 3])
+            lookup.assert_awaited_once_with('GET', 'places/test-place', 'location,attributions')
+
     async def test_nickname_whitespace_and_case_sensitive(self):
         for name in [' a', 'ab ', 'a b', 'a\tb', 'a\nb', 'a']:
             self.assertEqual((await self.client.put('/api/users/me/nickname', json={'nickname':name})).status_code, 422)
