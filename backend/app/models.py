@@ -70,3 +70,24 @@ idempotency_keys = Table("idempotency_keys", metadata,
     Column("response", JSON, nullable=False),
     Column("expires_at", DateTime(timezone=True), nullable=False, index=True),
 )
+
+generation_jobs = Table("generation_jobs", metadata,
+    Column("id", String(40), primary_key=True),
+    Column("user_id", Uuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True),
+    Column("fingerprint", String(64), nullable=False),
+    Column("created_at", DateTime(timezone=True), nullable=False, index=True),
+    Column("expires_at", DateTime(timezone=True), nullable=False),
+    Column("status", String(12), nullable=False),
+    Column("error_code", String(64)),
+    Column("cost_krw", Integer, nullable=False),
+    Column("input_tokens", Integer, nullable=False, server_default="0"),
+    Column("output_tokens", Integer, nullable=False, server_default="0"),
+    Column("version", Integer, nullable=False, server_default="1"),
+    Column("content", JSON),
+)
+
+generation_requests = Table("generation_requests", metadata,
+    Column("key", String(90), primary_key=True),
+    Column("window_start", DateTime(timezone=True), nullable=False),
+    Column("count", Integer, nullable=False),
+)

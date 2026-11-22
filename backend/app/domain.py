@@ -2,13 +2,14 @@ import hashlib
 import json
 import re
 import math
-from datetime import timedelta, datetime, time
+from datetime import timedelta, datetime, time, timezone
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Request, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, Request, Query
+import logging
 from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator, ValidationError
-from sqlalchemy import select, insert, update, delete, func, literal
+from sqlalchemy import select, insert, update, delete, func, literal, case
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
@@ -18,15 +19,23 @@ from .db import engine
 from .errors import fail
 from .models import users, trips, posts, post_hearts as hearts, idempotency_keys as keys
 from .planning import Conditions, options, DESTINATIONS, INTERESTS
+from . import config, generation
+from .models import generation_jobs as jobs, generation_requests as counters
+from .route_options import GOOGLE_MODES
 
 router = APIRouter(prefix='/api')
 
 
 async def verified_drafts():
-    # 실제 생성/편집 검증 저장소는 AI 단계에서 연결한다. 운영에서는 신뢰 초안이 없다.
-    # 테스트는 이 dependency만 교체하며 클라이언트 검증 플래그를 신뢰하지 않는다.
-    async def load(*args):
-        fail(409, 'INVALID_DRAFT', '검증된 생성 결과가 필요합니다.')
+    async def load(conn, uid, body):
+        row = (await conn.execute(select(jobs).where(jobs.c.id == body.draftId, jobs.c.user_id == uid,
+            jobs.c.status == 'completed', jobs.c.expires_at > now()).with_for_update())).mappings().first()
+        if not row:
+            fail(409, 'INVALID_DRAFT', '검증된 생성 결과가 필요합니다.')
+        conditions = row['content']['conditions']
+        return dict(ownerId=str(uid), version=row['version'], status='success', expiresAt=row['expires_at'],
+                    sourceTripId=conditions.get('sourceTripId'), baseTripVersion=conditions.get('baseTripVersion'),
+                    content=row['content'])
     return load
 
 
@@ -114,15 +123,23 @@ def validate_draft(draft, uid, body, trip_id=None):
         require(content['mapProvider'] == 'google' and content['transportMode'] == conditions.transportMode)
         require(len(days) == (conditions.endDate-conditions.startDate).days+1)
         require(not content.get('unmetConstraints'))
+        compact = content.get('storage') == 'place_ids'
         seen = set()
         for index, day in enumerate(days):
             require(day['day'] == index+1 and day['date'] == (conditions.startDate+timedelta(days=index)).isoformat())
             items, legs = day['items'], day['legs']
-            require(items and len(legs) == len(items)-1)
+            free_slots = day.get('freeSlots', [])
+            require(isinstance(free_slots, list) and len(free_slots) <= 7 and
+                    all(slot in ('breakfast', 'lunch', 'dinner', 'meal', 'activity') for slot in free_slots))
+            require((items or (compact and free_slots)) and len(legs) == max(0, len(items)-1))
             for order, item in enumerate(items):
                 require(item['id'] not in seen and item['order'] == order+1)
                 seen.add(item['id'])
                 place = item['place']
+                if compact:
+                    require(set(place) == {'providerPlaceId'} and place['providerPlaceId'])
+                    require(time.fromisoformat(item['startTime']) < time.fromisoformat(item['endTime']))
+                    continue
                 require(place['provider'] and place['providerPlaceId'] and place['name'])
                 require(datetime.fromisoformat(place['checkedAt']).utcoffset() is not None)
                 require(math.isfinite(place['latitude']) and -90 <= place['latitude'] <= 90)
@@ -132,10 +149,18 @@ def validate_draft(draft, uid, body, trip_id=None):
                 require(time.fromisoformat(item['startTime']) < time.fromisoformat(item['endTime']))
             for index, leg in enumerate(legs):
                 require(leg['fromItemId'] == items[index]['id'] and leg['toItemId'] == items[index+1]['id'])
-                require(leg['status'] == 'verified' and leg['mode'] == conditions.transportMode)
+                if compact:
+                    require(leg['mode'] in GOOGLE_MODES)
+                    continue
+                require(leg['status'] == 'verified' and leg['mode'] in ('walking', 'transit', 'driving'))
                 require(leg['provider'] and datetime.fromisoformat(leg['checkedAt']).utcoffset() is not None)
                 require(math.isfinite(leg['durationMinutes']) and leg['durationMinutes'] >= 0)
                 require(math.isfinite(leg['distanceMeters']) and leg['distanceMeters'] >= 0)
+                depart = time.fromisoformat(items[index]['endTime'])
+                arrive_by = time.fromisoformat(items[index+1]['startTime'])
+                available = (arrive_by.hour - depart.hour) * 60 + arrive_by.minute - depart.minute
+                require(leg['durationMinutes'] <= available)
+        require(seen)
         # 바탕 지도 정보는 서버 목록에서 정규화한다. 외부 초안의 중심 좌표를 신뢰하지 않는다.
         destination = DESTINATIONS[conditions.destinationId]
         content = dict(content, destination={**{k: destination[k] for k in ('id','countryCode','timeZone','mapCenter','mapZoom')}, 'name': destination['label']})
@@ -148,21 +173,122 @@ def validate_draft(draft, uid, body, trip_id=None):
 @router.get('/planning-options')
 async def planning(request: Request):
     await authenticate(request)
-    return options()
+    return dict(options(), generationAvailable=bool(config.openai_key and config.maps_key))
 
 
-@router.post('/generations')
-async def generate(body: Conditions, request: Request):
-    session = await authenticate(request, write=True)
+async def limit_requests(request, uid, scope, per_user, per_ip):
+    stamp = now()
+    ip = request.client.host if request.client else 'unknown'
+    limits = [('ip:'+hashlib.sha256(ip.encode()).hexdigest(), per_ip)]
+    if uid:
+        limits.append(('user:'+str(uid), per_user))
     async with engine.begin() as conn:
-        await lock_user(conn, session['user_id'])
+        await conn.execute(delete(counters).where(counters.c.window_start < stamp-timedelta(hours=1)))
+        for identity, maximum in limits:
+            expired = counters.c.window_start <= stamp-timedelta(minutes=1)
+            statement = pg_insert(counters).values(key=scope+identity, window_start=stamp, count=1)
+            row = (await conn.execute(statement.on_conflict_do_update(index_elements=[counters.c.key], set_={
+                'window_start': case((expired, stamp), else_=counters.c.window_start),
+                'count': case((expired, 1), else_=counters.c.count+1)
+            }).returning(counters.c.count, counters.c.window_start))).first()
+            if row[0] > maximum:
+                from fastapi import HTTPException
+                retry = max(1, math.ceil((row.window_start+timedelta(minutes=1)-stamp).total_seconds()))
+                raise HTTPException(429, dict(code='RATE_LIMITED', message='잠시 후 다시 시도해 주세요.'),
+                                    headers={'Retry-After':str(retry)})
+
+
+@router.post('/generations', status_code=202)
+async def generate(body: Conditions, request: Request, tasks: BackgroundTasks):
+    session = await authenticate(request, write=True)
+    uid = session['user_id']
+    await limit_requests(request, uid, 'generate', 3, 30)
+    if body.transportMode != 'walking':
+        fail(422, 'INVALID_SELECTION', '최초 생성은 도보 기준입니다.')
+    stamp = now()
+    async with engine.begin() as conn:
+        await lock_user(conn, uid)
+        if request.headers.get('idempotency-key'):
+            cached, values = await replay(conn, request, uid, body.model_dump(mode='json'))
+            if cached:
+                return cached
         if body.sourceTripId:
             trip = await owned(conn, session['user_id'], body.sourceTripId)
             if trip['version'] != body.baseTripVersion:
                 fail(409, 'VERSION_CONFLICT', '최신 일정을 확인해 주세요.')
         elif await count_trips(conn, session['user_id']) >= 3:
             fail(409, 'SAVED_TRIP_LIMIT_EXCEEDED', '저장 일정이 3개입니다. 기존 일정만 재생성할 수 있습니다.')
-    fail(503, 'GENERATION_UNAVAILABLE', '실제 장소와 경로를 검증하는 일정 생성을 준비 중입니다.')
+        if not request.headers.get('idempotency-key'):
+            fail(422, 'INVALID_SELECTION', '요청 식별자가 필요합니다.')
+        if not (config.openai_key and config.maps_key):
+            fail(503, 'GENERATION_UNAVAILABLE', '일정 생성 서비스 설정을 확인해 주세요.')
+        # Serialize admission across workers, but never hold the lock during paid calls.
+        await conn.execute(select(func.pg_advisory_xact_lock(7021101)))
+        await conn.execute(update(jobs).where(jobs.c.status == 'running',
+            jobs.c.created_at < stamp-timedelta(minutes=11)).values(status='failed', error_code='GENERATION_FAILED'))
+        fingerprint = hashlib.sha256(('prompt-v3:'+values['body_hash']).encode()).hexdigest()
+        common = jobs.c.user_id == uid
+        existing = await conn.scalar(select(jobs.c.id).where(common, jobs.c.fingerprint == fingerprint,
+            jobs.c.version == 1, jobs.c.status == 'completed', jobs.c.expires_at > stamp))
+        if existing:
+            status = dict(generationId=existing, status='completed', draftId=existing)
+            await remember(conn, values, status)
+            return status
+        if await conn.scalar(select(jobs.c.id).where(common, jobs.c.status == 'running').limit(1)):
+            fail(429, 'GENERATION_IN_PROGRESS', '이미 생성 중입니다.')
+        today = stamp.astimezone(timezone(timedelta(hours=9))).replace(hour=0,minute=0,second=0,microsecond=0)
+        month = today.replace(day=1)
+        for start, maximum, code in [(today,5,'DAILY_LIMIT_REACHED'), (month,20,'MONTHLY_LIMIT_REACHED')]:
+            if await conn.scalar(select(func.count()).select_from(jobs).where(common, jobs.c.created_at >= start)) >= maximum:
+                fail(429, code, '생성 한도에 도달했습니다.')
+        reserved = generation.cost(body.modelId, generation.MAX_INPUT, generation.MAX_OUTPUT)*generation.MAX_ATTEMPTS
+        total = await conn.scalar(select(func.coalesce(func.sum(jobs.c.cost_krw),0)).where(jobs.c.created_at >= month))
+        if total + reserved > config.generation_budget_krw:
+            fail(429, 'BUDGET_EXHAUSTED', '이번 달 생성 예산을 모두 사용했습니다.')
+        if total < 0.8*config.generation_budget_krw <= total+reserved:
+            logging.getLogger(__name__).warning('Monthly generation budget reached 80 percent')
+        job_id = 'gen_'+uuid4().hex
+        await conn.execute(insert(jobs).values(id=job_id,user_id=uid,fingerprint=fingerprint,created_at=stamp,
+            expires_at=stamp+timedelta(hours=1),status='running',cost_krw=reserved))
+        status = dict(generationId=job_id, status='queued')
+        await remember(conn, values, status)
+    tasks.add_task(generation.execute, job_id, body)
+    return status
+
+
+async def get_job(conn, uid, job_id, lock=False):
+    query = select(jobs).where(jobs.c.id == job_id, jobs.c.user_id == uid)
+    row = (await conn.execute(query.with_for_update() if lock else query)).mappings().first()
+    if not row:
+        fail(404, 'RESOURCE_NOT_FOUND', '작업을 찾을 수 없습니다.')
+    return row
+
+
+@router.get('/generations/{job_id}')
+async def generation_status(job_id: str, request: Request):
+    uid = (await authenticate(request))['user_id']
+    async with engine.connect() as conn:
+        row = await get_job(conn, uid, job_id)
+    status, code = row['status'], row['error_code']
+    if status == 'running' and now()-row['created_at'] > timedelta(minutes=11):
+        status, code = 'failed', 'GENERATION_FAILED'
+    progress = generation.active_progress.get(job_id) if status == 'running' else None
+    if status == 'completed':
+        progress = dict(stage='completed', percent=100)
+    return dict(generationId=job_id,status=status,draftId=job_id if status=='completed' else None,
+                progress=progress,
+                error={'code':code, 'details':(row['content'] or {}).get('failure')} if code else None)
+
+
+@router.get('/drafts/{draft_id}')
+async def draft_detail(draft_id: str, request: Request, day: int = Query(1, ge=1, le=7)):
+    uid = (await authenticate(request))['user_id']
+    await limit_requests(request, uid, 'display', 30, 120)
+    async with engine.connect() as conn:
+        row = await get_job(conn, uid, draft_id)
+    if row['status'] != 'completed' or row['expires_at'] <= now():
+        fail(409, 'INVALID_DRAFT', '유효한 초안이 필요합니다.')
+    return dict(await generation.display_day(row['content'], day), id=draft_id, version=row['version'], publishedPostId=None)
 
 
 @router.get('/trips')
@@ -177,12 +303,14 @@ async def list_trips(request: Request):
 
 
 @router.get('/trips/{trip_id}')
-async def trip_detail(trip_id: str, request: Request):
+async def trip_detail(trip_id: str, request: Request, day: int = Query(1, ge=1, le=7)):
     session = await authenticate(request)
     async with engine.begin() as conn:
         row = await owned(conn, session['user_id'], trip_id)
         post = await conn.scalar(select(posts.c.id).where(posts.c.trip_id == trip_id))
-    return dict(**row['content'], id=trip_id, version=row['version'], publishedPostId=post)
+    if row['content'].get('storage') == 'place_ids':
+        await limit_requests(request, session['user_id'], 'display', 30, 120)
+    return dict(await generation.display_day(row['content'], day), id=trip_id, version=row['version'], publishedPostId=post)
 
 
 @router.post('/trips', status_code=201)
@@ -258,7 +386,8 @@ def public_copy(content):
     return dict(destinationName=dest['label'], destination={k: dest[k] for k in ('id','mapCenter','mapZoom')},
         dayCount=len(content['days']), theme=' · '.join(INTERESTS[i] for i in content['conditions']['interestIds']),
         mapProvider='google', places=[dict(mapPlaceId='place_'+uuid4().hex, day=d['day'], order=index+1,
-            **{k: item['place'][k] for k in ('name','latitude','longitude')})
+            name=item.get('visitLabel') or item['place']['name'],
+            **{k: item['place'][k] for k in ('latitude','longitude') if k in item['place']})
             for d in content['days'] for index, item in enumerate(d['items'])])
 
 

@@ -9,12 +9,45 @@ from . import config as cfg
 from .auth import router as auth_router, clear_cookie
 from .domain import router as domain_router
 from .db import engine
+from .place_data import PlanningFailure
 
 app = FastAPI(title='Tripick API')
 app.add_middleware(CORSMiddleware, allow_origins=[cfg.frontend_origin],
     allow_credentials=True, allow_methods=cfg.cors_methods, allow_headers=cfg.cors_headers)
 app.include_router(auth_router)
 app.include_router(domain_router)
+
+
+class GenerationBodyLimit:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope['type'] != 'http' or scope['path'] != '/api/generations' or scope['method'] != 'POST':
+            return await self.app(scope, receive, send)
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message['type'] == 'http.disconnect':
+                return
+            chunk = message.get('body', b'')
+            if len(body) + len(chunk) > 16384:
+                response = JSONResponse({'error': {'code':'PAYLOAD_TOO_LARGE','message':'요청이 너무 큽니다.'}}, status_code=413)
+                return await response(scope, receive, send)
+            body.extend(chunk)
+            if not message.get('more_body'):
+                break
+        delivered = False
+        async def limited_receive():
+            nonlocal delivered
+            if delivered:
+                return await receive()
+            delivered = True
+            return {'type':'http.request','body':bytes(body),'more_body':False}
+        await self.app(scope, limited_receive, send)
+
+
+app.add_middleware(GenerationBodyLimit)
 
 
 @app.middleware('http')
@@ -33,7 +66,12 @@ async def private_responses(request: Request, call_next):
 @app.exception_handler(HTTPException)
 async def api_error(request, exc):
     detail = exc.detail if isinstance(exc.detail, dict) else dict(code='REQUEST_FAILED', message=str(exc.detail), retryable=False)
-    return JSONResponse({'error': detail}, status_code=exc.status_code)
+    return JSONResponse({'error': detail}, status_code=exc.status_code, headers=exc.headers)
+
+
+@app.exception_handler(PlanningFailure)
+async def external_error(request, exc):
+    return JSONResponse({'error': {'code':exc.code, 'message':'외부 조회를 완료하지 못했어요.'}}, status_code=502)
 
 
 @app.exception_handler(RequestValidationError)

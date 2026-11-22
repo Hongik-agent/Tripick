@@ -1,27 +1,54 @@
 """Build and verify itineraries. Only the user's plan and provider place IDs survive the run."""
+import asyncio
 import json
+import logging
+import math
+from copy import deepcopy
 from datetime import datetime, timedelta
 from itertools import permutations
 
-from sqlalchemy import func, select
+import httpx
+from sqlalchemy import func, select, update
 
 from . import config
 from .db import engine
-from .itinerary_agent import Timetable, candidate_schema, day_slots, fixed_start, ordered_timing
+from .itinerary_agent import Timetable, candidate_schema, day_slots, fixed_start, instructions, ordered_timing, run_planner
+from .models import generation_jobs as jobs
 from .place_data import GooglePlaces, PlanningFailure
 from .planning import DESTINATIONS
 from .route_options import route_option
 from .scheduling import Stop, VisitProblem, clock, fit_day, minutes
 
 
+MAX_INPUT = 32000
+MAX_OUTPUT = 6000
+MAX_ATTEMPTS = 2
+PRICES = {'gpt-6-luna': (0.1, 0.5), 'gpt-6.1-terra': (1, 5)}
+
+# Live updates are local to the worker executing each job.
+active_progress: dict[str, dict] = {}
+
+
 def compact_json(value):
     return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
+
+
+def cost(model, inputs, outputs):
+    in_price, out_price = PRICES[model]
+    return math.ceil((inputs * in_price + outputs * out_price) * config.generation_krw_per_usd / 1_000_000)
 
 
 async def local_instant(zone, day, clock):
     local = datetime.fromisoformat(f'{day}T{clock}')
     async with engine.connect() as conn:
         return await conn.scalar(select(func.timezone(zone, local)))
+
+
+async def leg_times(content, day, index):
+    items = day['items']
+    zone = content['destination']['timeZone']
+    return (await local_instant(zone, day['date'], items[index]['endTime']),
+            await local_instant(zone, day['date'], items[index+1]['startTime']))
 
 
 async def local_today(zone):
@@ -174,3 +201,84 @@ async def build(conditions, ask, client, report):
     return dict(storage='place_ids', conditions=conditions.model_dump(mode='json'),
                 destination={**dest, 'name': dest['label']}, transportMode='walking',
                 mapProvider='google', days=content_days, unmetConstraints=[])
+
+
+async def execute(job_id, conditions):
+    inputs = outputs = attempts = 0
+    uncertain = False
+    # One candidate plan, one schedule, and two checks per travel day.
+    total_steps = 2 + 2 * ((conditions.endDate - conditions.startDate).days + 1)
+    completed_steps = 0
+
+    def report(stage, completed=0, day=None):
+        nonlocal completed_steps
+        # A replacement repeats checks already counted for this request.
+        completed_steps = max(completed_steps, completed)
+        progress = dict(stage=stage, percent=100 * completed_steps // total_steps)
+        if day is not None:
+            progress['day'] = day
+        active_progress[job_id] = progress
+
+    async def ask(task, output_type):
+        nonlocal inputs, outputs, attempts, uncertain
+        # UTF-8 bytes bound ordinary tokenizer output. Include the structured response schema and framing.
+        size = len((instructions(conditions)+task+json.dumps(output_type.model_json_schema())).encode()) + 2048
+        if size > MAX_INPUT:
+            raise PlanningFailure('GENERATION_FAILED', 'input_limit')
+        if attempts >= MAX_ATTEMPTS:
+            raise PlanningFailure('GENERATION_FAILED', 'call_limit')
+        attempts += 1
+        uncertain = True
+        result = await run_planner(conditions, task, config.openai_key, output_type)
+        usage = result.context_wrapper.usage
+        inputs += usage.input_tokens
+        outputs += usage.output_tokens
+        uncertain = not usage.total_tokens
+        return result.final_output
+
+    values = {}
+    try:
+        async with asyncio.timeout(540), httpx.AsyncClient() as client:
+            content = await build(conditions, ask, client, report)
+        values.update(content=content, status='completed')
+    except PlanningFailure as exc:
+        current = active_progress.get(job_id, {})
+        detail = dict(stage=current.get('stage'), day=exc.day or current.get('day'),
+                      reason=exc.reason or exc.code, slot=exc.slot)
+        logging.getLogger(__name__).warning('Generation %s failed: %s', job_id, detail)
+        values.update(status='failed', error_code=exc.code, content={'failure': detail})
+    except Exception as exc:
+        current = active_progress.get(job_id, {})
+        detail = dict(stage=current.get('stage'), day=current.get('day'), reason='generation_error')
+        logging.getLogger(__name__).warning('Generation %s failed (%s): %s', job_id, type(exc).__name__, detail)
+        values.update(status='failed', error_code='GENERATION_FAILED', content={'failure': detail})
+    finally:
+        active_progress.pop(job_id, None)
+    if not uncertain:
+        values['cost_krw'] = cost(conditions.modelId, inputs, outputs)
+    values.update(input_tokens=inputs, output_tokens=outputs)
+    async with engine.begin() as conn:
+        await conn.execute(update(jobs).where(jobs.c.id == job_id, jobs.c.status == 'running').values(**values))
+
+
+async def display_day(content, number):
+    if content.get('storage') != 'place_ids':
+        return content
+    content = deepcopy(content)
+    async with httpx.AsyncClient() as client:
+        places = GooglePlaces(client, config.maps_key)
+        for day in content['days']:
+            if day['day'] != number:
+                day.update(items=[], legs=[])
+                day.pop('freeSlots', None)
+                continue
+            items = day['items']
+            displays = await asyncio.gather(*(places.display(item['place']['providerPlaceId']) for item in items))
+            for item, place in zip(items, displays):
+                item['place'] = place
+            for i, leg in enumerate(day['legs']):
+                depart, arrive = await leg_times(content, day, i)
+                metrics = await route_option(client, config.maps_key, leg['mode'], items[i]['place']['providerPlaceId'],
+                                             items[i+1]['place']['providerPlaceId'], depart, arrive)
+                leg.update(metrics)
+    return content

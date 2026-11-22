@@ -1,6 +1,6 @@
 import unittest
 from datetime import date, datetime, timedelta, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 
@@ -137,3 +137,19 @@ class ItineraryRules(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(PlanningFailure) as failure:
             await self.generate(closed='all')
         self.assertEqual(failure.exception.reason, 'no_visits')
+
+    async def test_failure_accounting_retains_only_diagnostic_fields(self):
+        async def failed(conditions, ask, client, report):
+            report('repairing', day=2)
+            raise PlanningFailure('VERIFICATION_FAILED', 'place_missing', 2, 'breakfast')
+
+        db = MagicMock()
+        write = db.begin.return_value.__aenter__.return_value.execute = AsyncMock()
+        with (patch.object(generation, 'build', failed), patch.object(generation, 'engine', db),
+              self.assertLogs(generation.__name__, level='WARNING') as logs):
+            await generation.execute('test-job', self.conditions)
+        values = write.await_args.args[0].compile().params
+        self.assertEqual(values['status'], 'failed')
+        self.assertEqual(values['content'], {'failure': dict(stage='repairing', day=2, reason='place_missing', slot='breakfast')})
+        self.assertIn('place_missing', logs.output[0])
+        self.assertNotIn('test-job', generation.active_progress)
