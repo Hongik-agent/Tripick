@@ -79,6 +79,7 @@ export type Trip = {
 }
 
 export type Post = {
+  publicMapAvailable?: boolean
   storage?: string
   id: string
   authorNickname: string

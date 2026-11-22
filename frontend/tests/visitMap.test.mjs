@@ -60,4 +60,10 @@ test("numbers visits in list order, links selections and removes the previous da
   drawVisits(maps, map, [], overview, onMarkerClick).remove()
   assert.deepEqual(map.setOptions.mock.calls.at(-1).arguments, [overview])
   assert.equal(lines.length, 1)
+  const gap = drawVisits(maps, map, [
+    { ...item("start", 37.1), order: 1 }, { ...item("end", 37.3), order: 3 },
+  ], overview, onMarkerClick)
+  assert.equal(pane.children[1].children[0].textContent, "3")
+  assert.equal(lines.length, 1, "a missing second stop must break the line")
+  gap.remove()
 })

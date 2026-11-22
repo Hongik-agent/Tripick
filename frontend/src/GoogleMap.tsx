@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react"
-import type { Item } from "./api"
-import { drawVisits, type MapsApi } from "./visitMap"
+import { drawVisits, type MapsApi, type MapVisit } from "./visitMap"
 
 type MapsWindow = Window & {
   google?: { maps?: MapsApi }
@@ -54,18 +53,21 @@ export default function GoogleMap({
   items,
   selection,
   onSelect,
+  onUnavailable,
 }: {
   center: { latitude: number; longitude: number }
   zoom: number
   label: string
-  items: Item[]
+  items: MapVisit[]
   selection: { id: string } | null
   onSelect: (id: string) => void
+  onUnavailable?: () => void
 }) {
   const container = useRef<HTMLDivElement>(null)
   const [error, setError] = useState("")
   const [view, setView] = useState<{ maps: MapsApi; map: InstanceType<MapsApi["Map"]> } | null>(null)
   const layer = useRef<ReturnType<typeof drawVisits> | null>(null)
+  useEffect(() => { if (error) onUnavailable?.() }, [error, onUnavailable])
 
   useEffect(() => {
     setError("")

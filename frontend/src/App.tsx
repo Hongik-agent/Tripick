@@ -19,6 +19,10 @@ import {
 } from "./api"
 
 import GoogleMap from "./GoogleMap"
+import { usePublicDayMap } from "./usePublicDayMap"
+import type { MapVisit } from "./visitMap"
+
+const emptyVisits: MapVisit[] = []
 
 import WorldMap from "./WorldMap"
 
@@ -125,6 +129,17 @@ export default function App() {
 
   const [options, setOptions] = useState<Options | null>(null)
 
+  useEffect(() => {
+    if (page !== "detail" || options) return
+    const controller = new AbortController()
+    api<Options>("/planning-options", { signal: controller.signal })
+      .then(setOptions)
+      .catch(() => {
+        if (!controller.signal.aborted) setNotice("여행 조건 이름을 불러오지 못했어요.")
+      })
+    return () => controller.abort()
+  }, [page, options])
+
   const [form, setForm] = useState<Conditions>(initial)
 
   const [step, setStep] = useState(0)
@@ -136,6 +151,8 @@ export default function App() {
   const [day, setDay] = useState(1)
   const [visitSelection, setVisitSelection] = useState<{ id: string } | null>(null)
   const mapPanel = useRef<HTMLElement>(null)
+  const [publicMapFailed, setPublicMapFailed] = useState(false)
+  const markMapFailed = useCallback(() => setPublicMapFailed(true), [])
   const selectMarker = useCallback((id: string) => {
     setVisitSelection({ id })
     document.getElementById("visit-" + id)?.scrollIntoView({ block: "nearest" })
@@ -338,6 +355,7 @@ export default function App() {
     void perform(async () => {
       const result = await api<Post>("/posts/" + id, {}, true)
       setPost(result)
+      setPublicMapFailed(false)
       setTrip(null)
       setDay(1)
       go("community")
@@ -398,13 +416,26 @@ export default function App() {
 
   const draft = page === "draft"
   const publicDetail = page === "community"
+  const StopGroup = publicDetail ? "div" : Fragment
   const detailDestination = trip?.destination
   const detailLabel = trip?.destination.name ?? post?.destinationName ?? ""
   const providerId = draft ? form.mapProvider : trip?.conditions.mapProvider
   const provider = providersFor(detailDestination?.countryCode).find((p) => p.id === providerId) ?? mapProviders[0]
   const detailDays = trip?.days.length ?? post?.dayCount ?? 0
+  const savedConditions = page === "detail" ? trip?.conditions : undefined
+  const ticketTags = publicDetail ? post?.theme.split("·").map(s => s.trim()).filter(Boolean) :
+    savedConditions && options ? [
+      ...options.interests.filter(v => savedConditions.interestIds.includes(v.id)),
+      options.companionTypes.find(v => v.id === savedConditions.party.typeId),
+      options.partySizes.find(v => v.id === savedConditions.party.sizeBand),
+      options.paces.find(v => v.id === savedConditions.paceId),
+    ].map(v => v?.label).filter(Boolean) : []
   const tripPath = (draft ? "/drafts/" : "/trips/") + trip?.id
   const dayItems = trip?.days.find((d) => d.day === day)?.items
+  const publicMapEnabled = publicDetail && post?.publicMapAvailable && !publicMapFailed && !!import.meta.env.VITE_GOOGLE_MAPS_API_KEY
+  const publicMap = usePublicDayMap(publicMapEnabled ? post?.id : undefined, day, mapPanel)
+  const publicPoints = publicMap.result?.available ? publicMap.result.items : emptyVisits
+  const publicMapShown = publicMapEnabled && (!publicMap.result || publicPoints.length > 0)
   const items = dayItems?.map((item) => ({
     ...item.place,
     id: item.id,
@@ -937,27 +968,30 @@ export default function App() {
         </main>
       ) : (draft || page === "detail" || page === "community") &&
         (detailDestination || (publicDetail && post)) ? (
-        <main className="content">
+        <main className={publicDetail ? "content public-story" : "content"}>
           <button
             className="back"
             onClick={() => go(draft ? "form" : trip ? "saved" : "home")}
           >
             ← {draft ? "여행 조건으로" : "목록으로"}
           </button>
-          <span className="eyebrow">
-            {draft ? "AI 생성 일정" : trip ? "MY TRIP" : "TRAVEL STORY"}
-          </span>
-          <h1>
-            {detailLabel}, {detailDays}일의 여행
-          </h1>
-          {trip ? (
-            <p>
-              {trip.conditions.startDate} ~ {trip.conditions.endDate}
-            </p>
+          {(publicDetail && post) || savedConditions ? (
+            <div className="story-ticket">
+              <div className="story-cover">
+                <p className="story-author">{savedConditions ? "내 일정" : post?.authorNickname + "의 여행 일정"}</p>
+                <h1>{detailLabel}</h1>
+                {savedConditions && <p className="story-dates">{savedConditions.startDate} ~ {savedConditions.endDate}</p>}
+                <div className="story-themes">{ticketTags?.map(theme =>
+                  <span key={theme}>{theme}</span>)}</div>
+              </div>
+              <div className="story-duration"><strong>{detailDays}</strong><span>일 여행</span></div>
+            </div>
           ) : (
-            <p>
-              {post?.authorNickname} · {post?.theme}
-            </p>
+            <>
+              <span className="eyebrow">{draft ? "AI 생성 일정" : "MY TRIP"}</span>
+              <h1>{detailLabel}, {detailDays}일의 여행</h1>
+              <p>{trip?.conditions.startDate} ~ {trip?.conditions.endDate}</p>
+            </>
           )}
           <div className="result-top">
             <div className="day-tabs">
@@ -965,6 +999,7 @@ export default function App() {
                 <button
                   key={i}
                   className={day === i + 1 ? "chosen" : ""}
+                  aria-pressed={day === i + 1}
                   disabled={busy}
                   onClick={() => selectDay(i + 1)}
                 >
@@ -973,23 +1008,25 @@ export default function App() {
               ))}
             </div>
           </div>
-          <div className={publicDetail ? "public-itinerary" : "result-grid"}>
+          <div className={publicDetail ? "public-itinerary" + (publicMapShown ? " with-map" : "") : "result-grid"}>
             <section className="timeline">
-              <h2>방문 장소</h2>
+              <h2>{publicDetail ? <>{day}일차 일정 <span>방문 장소 {items.length}곳</span></> : "방문 장소"}</h2>
               {items.map((item, i) => {
                 const leg = trip?.days[day-1]?.legs[i]
+                const visitId = "id" in item ? item.id : item.mapPlaceId
+                const selectable = "id" in item || publicPoints.some(point => point.id === visitId)
                 return (
-                <Fragment key={"id" in item ? item.id : item.mapPlaceId}>
-                  <article id={"id" in item ? "visit-" + item.id : undefined}
-                    className={"place" + ("id" in item && visitSelection?.id === item.id ? " place-focused" : "")}>
+                <StopGroup key={"id" in item ? item.id : item.mapPlaceId}>
+                  <article id={"visit-" + visitId}
+                    className={"place" + (visitSelection?.id === visitId ? " place-focused" : "")}>
                     <span className="place-number">{i + 1}</span>
                     <div>
-                      <h3>{"id" in item ? (
+                      <h3>{selectable ? (
                         <button type="button" className="visit-select"
                           aria-label={`${i + 1}. ${item.name} 지도에서 보기`}
-                          aria-pressed={visitSelection?.id === item.id}
+                          aria-pressed={visitSelection?.id === visitId}
                           onClick={() => {
-                            setVisitSelection({ id: item.id })
+                            setVisitSelection({ id: visitId })
                             mapPanel.current?.scrollIntoView({ block: "nearest" })
                           }}>{item.name}</button>
                       ) : item.name}</h3>
@@ -1015,7 +1052,7 @@ export default function App() {
                       <span aria-hidden="true">🗺️</span> {provider.label}
                     </a>
                   </div>
-                </Fragment>
+                </StopGroup>
                 )
               })}
               {freeSlots.length > 0 && <p>현지에서 자유롭게 정해 주세요 · {freeSlots.map(slot =>
@@ -1023,6 +1060,16 @@ export default function App() {
               ).join(" · ")}</p>}
               {!items.length && !freeSlots.length && <p>방문 장소가 없습니다.</p>}
             </section>
+            {publicMapEnabled && <section className="public-day-map route-map visit-map" ref={mapPanel}
+              hidden={!publicMapShown} aria-label={`${day}일차 방문 지도`}>
+              <p className="visit-map-legend">DAY {day} · 방문 순서</p>
+              {!publicMap.result && <p role="status">지도를 불러오는 중이에요.</p>}
+              {publicMap.overview && <GoogleMap center={publicMap.overview.center} zoom={publicMap.overview.zoom}
+                label={detailLabel} items={publicPoints} selection={visitSelection} onSelect={selectMarker}
+                onUnavailable={markMapFailed} />}
+              {Array.from(new Set(publicPoints.flatMap(p => p.place.attributions?.map(a => a.provider).filter(Boolean) ?? []))).map(name =>
+                <small key={name}>{name}</small>)}
+            </section>}
             {!publicDetail && detailDestination && dayItems && <section className="route-map visit-map" ref={mapPanel}>
               <p className="visit-map-legend">DAY {day} · 방문 순서</p>
               <GoogleMap

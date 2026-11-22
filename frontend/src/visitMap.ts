@@ -1,6 +1,7 @@
 import type { Item } from "./api"
 
 type Point = { lat: number; lng: number }
+export type MapVisit = Pick<Item, "id" | "place" | "order">
 type MapOptions = { center: Point; zoom: number }
 type Bounds = { extend(point: Point): void }
 type VisitMap = {
@@ -25,15 +26,21 @@ export type MapsApi = {
   }) => { setMap(map: VisitMap | null): void }
 }
 
-export function drawVisits(maps: MapsApi, map: VisitMap, items: Item[], overview: MapOptions,
+export function drawVisits(maps: MapsApi, map: VisitMap, items: MapVisit[], overview: MapOptions,
   onSelect: (id: string) => void) {
   const path: Point[] = []
+  const segments: Point[][] = []
+  let previousOrder = -1
   const groups = new Map<string, { point: Point; pins: HTMLDivElement }>()
   const visits = new Map<string, { button: HTMLButtonElement; point: Point }>()
-  items.forEach(({ id, place }, index) => {
+  items.forEach(({ id, place, order }, index) => {
+    const number = order ?? index + 1
     const point = { lat: place.latitude, lng: place.longitude }
     if (!Number.isFinite(point.lat) || !Number.isFinite(point.lng)) return
     path.push(point)
+    if (!segments.length || previousOrder + 1 !== number) segments.push([])
+    segments[segments.length - 1].push(point)
+    previousOrder = number
     const key = `${point.lat},${point.lng}`
     let group = groups.get(key)
     if (!group) {
@@ -43,8 +50,8 @@ export function drawVisits(maps: MapsApi, map: VisitMap, items: Item[], overview
     }
     const button = document.createElement("button")
     button.type = "button"
-    button.textContent = String(index + 1)
-    button.setAttribute("aria-label", `${index + 1}. ${place.name}`)
+    button.textContent = String(number)
+    button.setAttribute("aria-label", `${number}. ${place.name}`)
     button.setAttribute("aria-pressed", "false")
     button.onclick = () => onSelect(id)
     group.pins.append(button)
@@ -70,9 +77,9 @@ export function drawVisits(maps: MapsApi, map: VisitMap, items: Item[], overview
     overlay.setMap(map)
     return overlay
   })
-  const line = path.length > 1 ? new maps.Polyline({
-    map, path, strokeColor: "#21796e", strokeWeight: 3, clickable: false,
-  }) : null
+  const lines = segments.filter(segment => segment.length > 1).map(segment => new maps.Polyline({
+    map, path: segment, strokeColor: "#21796e", strokeWeight: 3, clickable: false,
+  }))
   if (groups.size > 1) {
     const bounds = new maps.LatLngBounds()
     path.forEach(point => bounds.extend(point))
@@ -91,7 +98,7 @@ export function drawVisits(maps: MapsApi, map: VisitMap, items: Item[], overview
     },
     remove() {
       overlays.forEach(overlay => overlay.setMap(null))
-      line?.setMap(null)
+      lines.forEach(line => line.setMap(null))
     },
   }
 }
