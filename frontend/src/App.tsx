@@ -8,6 +8,7 @@ import {
   generateDraft,
   GenerationFailed,
   type GenerationProgress,
+  type Leg,
   type User,
   type Options,
   type Conditions,
@@ -134,12 +135,16 @@ export default function App() {
 
   const [day, setDay] = useState(1)
 
+  const [legOptions, setLegOptions] = useState<Leg[]>([])
+  const [legError, setLegError] = useState("")
   const [progress, setProgress] = useState<GenerationProgress | null>(null)
   const generating = progress !== null
   const generationRequest = useRef<{ body: string; key: string } | null>(null)
   const submission = useRef<AbortController | null>(null)
 
+  const [legIndex, setLegIndex] = useState(0)
 
+  const legDialog = useRef<HTMLDialogElement>(null)
 
   const [modal, setModal] = useState("")
 
@@ -437,6 +442,35 @@ export default function App() {
       } : result)
     }
     setDay(next)
+  })
+
+  const legPath = (index: number) => tripPath + "/days/" + day + "/legs/" + (index + 1)
+  const showLeg = (index: number) => void perform(async () => {
+    setLegIndex(index)
+    setLegError("")
+    setLegOptions([])
+    if (!legDialog.current?.open) legDialog.current?.showModal()
+    try {
+      const result = await api<{options: Leg[]}>(legPath(index))
+      setLegOptions(result.options)
+    } catch (e) {
+      setLegError(e instanceof ApiError ? e.message : "경로를 조회하지 못했어요.")
+    }
+  })
+
+  const chooseLeg = (mode: string) => void perform(async () => {
+    if (!trip) return
+    try {
+      const result = await api<{leg: Leg; version: number}>(legPath(legIndex), {
+        method: "PUT", headers: { "If-Match": String(trip.version) }, body: JSON.stringify({mode}),
+      })
+      setTrip({ ...trip, version: result.version, days: trip.days.map(d => d.day !== day ? d : {
+        ...d, legs: d.legs.map((leg, i) => i === legIndex ? result.leg : leg),
+      }) })
+      legDialog.current?.close()
+    } catch (e) {
+      setLegError(e instanceof ApiError ? e.message : "이동수단을 변경하지 못했어요.")
+    }
   })
 
   const saveDraft = () => void perform(async () => {
@@ -946,10 +980,10 @@ export default function App() {
                   </article>
                   <div className="place-actions">
                     {leg && (
-                      <span className="leg-button">
+                      <button className="leg-button" disabled={busy} onClick={() => showLeg(i)}>
                         {modeLabels[leg.mode]} · {leg.status === "verified"
-                          ? `${leg.durationMinutes}분 · ${leg.distanceMeters}m` : "경로 확인"}
-                      </span>
+                          ? `${leg.durationMinutes}분 · ${leg.distanceMeters}m` : "경로 확인"} ›
+                      </button>
                     )}
                     <a className="place-map-link"
                       href={provider.search + encodeURIComponent(detailLabel + " " + item.name) +
@@ -968,13 +1002,57 @@ export default function App() {
               {!items.length && !freeSlots.length && <p>방문 장소가 없습니다.</p>}
             </section>
             {detailDestination && <section className="route-map">
-              <GoogleMap
+              {draft || !trip ? <GoogleMap
                 center={detailDestination.mapCenter}
                 zoom={detailDestination.mapZoom}
                 label={detailLabel}
-              />
+              /> : import.meta.env.VITE_GOOGLE_MAPS_API_KEY ? (
+                <iframe
+                  className="h-full min-h-[470px] w-full"
+                  title={`${detailLabel} 중심 Google 지도`}
+                  loading="lazy"
+                  allowFullScreen
+                  referrerPolicy="strict-origin-when-cross-origin"
+                  src={`https://www.google.com/maps/embed/v1/view?${new URLSearchParams({
+                    key: import.meta.env.VITE_GOOGLE_MAPS_API_KEY,
+                    center: `${detailDestination.mapCenter.latitude},${detailDestination.mapCenter.longitude}`,
+                    zoom: String(detailDestination.mapZoom),
+                  })}`}
+                />
+              ) : <p role="alert">지금은 지도를 표시할 수 없어요.</p>}
             </section>}
           </div>
+          {trip && (
+            <dialog
+              ref={legDialog}
+              className="leg-dialog"
+              aria-labelledby="leg-title"
+            >
+              <form method="dialog">
+                <button className="close" aria-label="닫기">
+                  ×
+                </button>
+              </form>
+              <h2 id="leg-title">이 구간 이동수단</h2>
+              <p>
+                {items[legIndex]?.name} → {items[legIndex + 1]?.name}
+              </p>
+              {legError && <p role="alert">{legError}</p>}
+              {Object.entries(modeLabels).map(([mode, label]) => {
+                const option = legOptions.find(o => o.mode === mode)
+                const status = option?.status
+                return <button key={mode} className="leg-option" disabled={busy || status !== "verified"}
+                  aria-pressed={trip.days[day-1]?.legs[legIndex]?.mode === mode}
+                  onClick={() => chooseLeg(mode)}>
+                  <span>{label}</span><span>{status === "verified" ? option?.durationMinutes + "분" :
+                    status === "no_route" ? "이 구간은 경로 없음" : status === "time_conflict" ?
+                    "다음 방문 시간에 도착하기 어려워요" : busy ? "조회 중…" : "조회 실패"}</span>
+                </button>
+              })}
+              {(legError || legOptions.some(o => o.status === "lookup_failed")) &&
+                <button className="secondary" disabled={busy} onClick={() => showLeg(legIndex)}>다시 조회</button>}
+            </dialog>
+          )}
           <p className="migration-notice">
             실제 장소 마커와 경로 표시는 후속 단계에서 제공됩니다.
           </p>

@@ -4,8 +4,11 @@ import re
 import math
 from datetime import timedelta, datetime, time, timezone
 from uuid import uuid4
+from typing import Literal
+from copy import deepcopy
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Request, Query
+import httpx
 import logging
 from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator, ValidationError
@@ -21,7 +24,7 @@ from .models import users, trips, posts, post_hearts as hearts, idempotency_keys
 from .planning import Conditions, options, DESTINATIONS, INTERESTS
 from . import config, generation
 from .models import generation_jobs as jobs, generation_requests as counters
-from .route_options import GOOGLE_MODES
+from .route_options import GOOGLE_MODES, route_choices, route_option
 
 router = APIRouter(prefix='/api')
 
@@ -289,6 +292,65 @@ async def draft_detail(draft_id: str, request: Request, day: int = Query(1, ge=1
     if row['status'] != 'completed' or row['expires_at'] <= now():
         fail(409, 'INVALID_DRAFT', '유효한 초안이 필요합니다.')
     return dict(await generation.display_day(row['content'], day), id=draft_id, version=row['version'], publishedPostId=None)
+
+
+class LegSelection(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    mode: Literal['walking','transit','driving']
+
+
+async def leg_record(request, doc_id, day, leg, draft, write):
+    uid = (await authenticate(request, write=write))['user_id']
+    await limit_requests(request, uid, 'legs', 30, 120)
+    table = jobs if draft else trips
+    owner = jobs.c.user_id if draft else trips.c.owner_id
+    async with engine.connect() as conn:
+        row = (await conn.execute(select(table).where(table.c.id == doc_id, owner == uid))).mappings().first()
+    if row is None:
+        fail(404,'RESOURCE_NOT_FOUND','일정을 찾을 수 없습니다.')
+    if draft and (row['status'] != 'completed' or row['expires_at'] <= now()):
+        fail(409,'INVALID_DRAFT','초안을 확인해 주세요.')
+    if write:
+        match_version(request,row['version'])
+    content = row['content']
+    if not 1 <= day <= len(content['days']) or not 1 <= leg <= len(content['days'][day-1]['legs']):
+        fail(404,'RESOURCE_NOT_FOUND','이동 구간을 찾을 수 없습니다.')
+    active_day = content['days'][day-1]
+    left, right = active_day['items'][leg-1:leg+1]
+    depart, arrive = await generation.leg_times(content, active_day, leg-1)
+    return table, owner == uid, row, (left['place']['providerPlaceId'], right['place']['providerPlaceId'], depart, arrive)
+
+
+@router.get('/drafts/{doc_id}/days/{day}/legs/{leg}')
+@router.get('/trips/{doc_id}/days/{day}/legs/{leg}')
+async def get_leg(doc_id: str, day: int, leg: int, request: Request):
+    _, _, row, args = await leg_record(request, doc_id, day, leg, '/drafts/' in request.url.path, False)
+    async with httpx.AsyncClient() as client:
+        choices = await route_choices(client, config.maps_key, *args)
+    return dict(options=choices, version=row['version'])
+
+
+@router.put('/drafts/{doc_id}/days/{day}/legs/{leg}')
+@router.put('/trips/{doc_id}/days/{day}/legs/{leg}')
+async def choose_leg(doc_id: str, day: int, leg: int, body: LegSelection, request: Request):
+    draft = '/drafts/' in request.url.path
+    table, owner, row, args = await leg_record(request, doc_id, day, leg, draft, True)
+    async with httpx.AsyncClient() as client:
+        result = await route_option(client, config.maps_key, body.mode, *args)
+    if result['status'] != 'verified':
+        code = {'no_route':'ROUTE_UNAVAILABLE','time_conflict':'ROUTE_TIME_CONFLICT','lookup_failed':'EXTERNAL_DATA_UNAVAILABLE'}[result['status']]
+        fail(502 if result['status']=='lookup_failed' else 409, code, '이 수단을 적용할 수 없습니다.')
+    content = deepcopy(row['content'])
+    stored_leg = content['days'][day-1]['legs'][leg-1]
+    stored_leg['mode'] = body.mode
+    version = row['version']+1
+    async with engine.begin() as conn:
+        statement = update(table).where(table.c.id == doc_id, owner, table.c.version == row['version'])
+        if draft:
+            statement = statement.where(jobs.c.expires_at > now())
+        if (await conn.execute(statement.values(content=content,version=version))).rowcount != 1:
+            fail(409,'VERSION_CONFLICT','일정이 변경됐어요.')
+    return dict(version=version, leg={**stored_leg, **result})
 
 
 @router.get('/trips')
