@@ -10,8 +10,9 @@ from .auth import router as auth_router, clear_cookie
 from .domain import router as domain_router
 from .db import engine
 from .place_data import PlanningFailure
+from .tour_api import lifespan
 
-app = FastAPI(title='Tripick API')
+app = FastAPI(title='Tripick API', lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=[cfg.frontend_origin],
     allow_credentials=True, allow_methods=cfg.cors_methods, allow_headers=cfg.cors_headers)
 app.include_router(auth_router)

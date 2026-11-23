@@ -5,32 +5,27 @@ import logging
 import math
 from copy import deepcopy
 from datetime import datetime, timedelta
-from itertools import permutations
 
 import httpx
 from sqlalchemy import func, select, update
 
 from . import config
 from .db import engine
-from .itinerary_agent import Timetable, candidate_schema, day_slots, fixed_start, instructions, ordered_timing, run_planner
+from .itinerary_agent import Candidate, candidate_schema, candidate_task, day_slots, fixed_start, instructions, run_planner
 from .models import generation_jobs as jobs
 from .place_data import GooglePlaces, PlanningFailure
 from .planning import DESTINATIONS
 from .route_options import route_option
-from .scheduling import Stop, VisitProblem, clock, fit_day, minutes
+from .scheduling import Stop, VisitProblem, alternative_orders, fit_day, minutes, preferred_starts
 
 
 MAX_INPUT = 32000
 MAX_OUTPUT = 6000
-MAX_ATTEMPTS = 2
+MAX_ATTEMPTS = 1
 PRICES = {'gpt-6-luna': (0.1, 0.5), 'gpt-6.1-terra': (1, 5)}
 
 # Live updates are local to the worker executing each job.
 active_progress: dict[str, dict] = {}
-
-
-def compact_json(value):
-    return json.dumps(value, ensure_ascii=False, separators=(',', ':'))
 
 
 def cost(model, inputs, outputs):
@@ -38,147 +33,123 @@ def cost(model, inputs, outputs):
     return math.ceil((inputs * in_price + outputs * out_price) * config.generation_krw_per_usd / 1_000_000)
 
 
-async def local_instant(zone, day, clock):
-    local = datetime.fromisoformat(f'{day}T{clock}')
+async def trip_calendar(zone, dates):
+    midnights = [func.timezone(zone, datetime.combine(day, datetime.min.time())) for day in dates]
     async with engine.connect() as conn:
-        return await conn.scalar(select(func.timezone(zone, local)))
+        today, *instants = (await conn.execute(select(func.timezone(zone, func.now()), *midnights))).one()
+    return today.date(), instants
 
 
-async def leg_times(content, day, index):
-    items = day['items']
-    zone = content['destination']['timeZone']
-    return (await local_instant(zone, day['date'], items[index]['endTime']),
-            await local_instant(zone, day['date'], items[index+1]['startTime']))
-
-
-async def local_today(zone):
+async def day_leg_times(zone, date, items, indices):
+    """Convert all requested departure/arrival pairs in one PostgreSQL timezone query."""
+    if not indices:
+        return {}
+    conversions = []
+    for i in indices:
+        for clock in (items[i]['endTime'], items[i+1]['startTime']):
+            conversions.append(func.timezone(zone, datetime.fromisoformat(f'{date}T{clock}')))
     async with engine.connect() as conn:
-        return (await conn.scalar(select(func.timezone(zone, func.now())))).date()
+        times = (await conn.execute(select(*conversions))).one()
+    return {i: (times[2*n], times[2*n+1]) for n, i in enumerate(indices)}
 
 
 async def build(conditions, ask, client, report):
     places = GooglePlaces(client, config.maps_key)
     dest = DESTINATIONS[conditions.destinationId]
     zone = dest['timeZone']
-    today = await local_today(zone)
     count = (conditions.endDate - conditions.startDate).days + 1
+    dates = [conditions.startDate + timedelta(days=i) for i in range(count)]
+    today, midnights = await trip_calendar(zone, dates)
     place_cache, walk_cache = {}, {}
+    search_failed = False
 
-    async def lookup(label, slot, date):
-        if label not in place_cache:
-            place_cache[label] = await places.search(label, conditions.destinationId)
-        return Stop.from_place(label, slot, place_cache[label], date, today)
+    async def search(name):
+        nonlocal search_failed
+        try:
+            return await places.search(name, conditions.destinationId)
+        except PlanningFailure as exc:
+            if exc.code != 'EXTERNAL_DATA_UNAVAILABLE':
+                raise
+            search_failed = True
+            return None
+
+    async def resolve(candidates, slots, date):
+        missing = list(dict.fromkeys(c.name for c in candidates if c.name not in place_cache))
+        results = await asyncio.gather(*(search(name) for name in missing))
+        place_cache.update(zip(missing, results))
+        return [Stop.from_place(c, slot, place_cache[c.name], date, today)
+                for c, slot in zip(candidates, slots, strict=True)]
 
     async def walking(stops, midnight):
-        durations = []
-        for left, right in zip(stops, stops[1:]):
-            pair = left.place_id, right.place_id
-            if None in pair or left.problem or right.problem:
-                durations.append(None)
-                continue
-            if pair not in walk_cache:
-                # WALK uses place IDs only. Check the actual visit-time gap when fitting the day.
-                route = await route_option(client, config.maps_key, 'walking', *pair, midnight, midnight + timedelta(days=1))
-                if route['status'] == 'lookup_failed':
-                    raise PlanningFailure('EXTERNAL_DATA_UNAVAILABLE', 'route_lookup')
-                walk_cache[pair] = route.get('durationMinutes')
-            durations.append(walk_cache[pair])
-        return durations
+        pairs = [(left.place_id, right.place_id) if not (left.problem or right.problem) else None
+                 for left, right in zip(stops, stops[1:])]
+        missing = list(dict.fromkeys(pair for pair in pairs if pair and pair not in walk_cache))
+        routes = await asyncio.gather(*(route_option(client, config.maps_key, 'walking', *pair,
+                                                     midnight, midnight + timedelta(days=1)) for pair in missing))
+        for pair, route in zip(missing, routes):
+            walk_cache[pair] = route.get('durationMinutes')
+        return [walk_cache.get(pair) for pair in pairs]
 
-    async def fit_or_reorder(stops, timing, walks, day, fixed, midnight):
+    async def fit_or_reorder(stops, starts, day, fixed, midnight):
+        walks = await walking(stops, midnight)
         try:
-            return stops, timing, fit_day(stops, timing, walks, day, fixed), walks
+            return stops, fit_day(stops, starts, walks, day, fixed), walks
         except VisitProblem as first:
-            if first.reason not in ('time_conflict', 'no_walk', 'visit_window'):
+            if first.reason not in ('time_conflict', 'visit_window', 'unconfirmed_area'):
                 raise
-            activities = [i for i, stop in enumerate(stops) if stop.slot == 'activity']
-            # At most four activities. Prefer orders that move the fewest original visits.
-            alternatives = sorted(permutations(activities), key=lambda order: sum(a != b for a, b in zip(activities, order)))
-            for order in alternatives[1:]:
-                reordered, times = stops.copy(), timing.copy()
-                for target, source in zip(activities, order):
-                    reordered[target] = stops[source]
-                    visit = timing[source]
-                    stay = minutes(visit.end) - minutes(visit.start)
-                    start = min(minutes(timing[target].start), 1439 - stay)
-                    times[target] = visit.model_copy(update={'start': clock(start), 'end': clock(start + stay)})
+            for reordered, preferred in alternative_orders(stops, starts):
                 try:
-                    # Eliminate impossible opening-hour orders before looking up new legs.
-                    fit_day(reordered, times, [0] * len(walks), day, fixed)
+                    # Reject impossible orders from known legs before requesting any new pairs.
+                    known_walks = [walk_cache.get((a.place_id, b.place_id), 0)
+                                   for a, b in zip(reordered, reordered[1:])]
+                    fit_day(reordered, preferred, known_walks, day, fixed)
                     new_walks = await walking(reordered, midnight)
-                    fitted = fit_day(reordered, times, new_walks, day, fixed)
+                    fitted = fit_day(reordered, preferred, new_walks, day, fixed)
                 except VisitProblem:
                     continue
-                return reordered, times, fitted, new_walks
+                return reordered, fitted, new_walks
             raise
 
     report('planning', 0)
-    candidates = await ask('날짜별 자리 순서대로 서로 도보 이동이 편한 후보를 채운다. 이름과 같은 용도의 인근 대안만 반환한다.',
-                           candidate_schema(conditions))
-    days, evidence = [], []
-    for index in range(count):
-        day = index + 1
-        report('checking', day, day)
-        date = conditions.startDate + timedelta(days=index)
-        midnight = await local_instant(zone, date, '00:00')
-        names = getattr(candidates, f'day_{day}')
-        stops = [await lookup(candidate.name, slot, date)
-                 for candidate, slot in zip(names, day_slots(conditions, index), strict=True)]
-        days.append((date, midnight, names, stops))
-        evidence.append(dict(date=date.isoformat(), candidates=[s.evidence() for s in stops],
-                             walkingMinutes=await walking(stops, midnight)))
-
-    report('scheduling', 1 + count)
-    schedule = await ask('각 날짜의 후보 번호(1부터)를 한 번씩 사용한다. hours는 현지 방문 가능 구간, '
-                         'basis=unknown이면 영업정보가 없는 장소이므로 적절한 방문 시각을 제안한다. '
-                         'walkingMinutes는 후보 순서에서 이웃 간 도보 분이다. null이면 이동시간이 확인되지 않았다. '
-                         '체류시간과 이동 여유를 두고 식사 순서를 지킨다. 관광은 같은 날 안에서 재배치한다. '
-                         '영업 불가 후보도 번호는 유지하여 서버가 해당 자리만 교체할 수 있게 한다.\n'
-                         + compact_json(evidence), Timetable)
-    if len(schedule.days) != count:
-        raise PlanningFailure('VERIFICATION_FAILED', 'day_count')
-
+    candidates = await ask(candidate_task(conditions), candidate_schema(conditions))
     repaired = False
     content_days = []
-    for index, (timing, data) in enumerate(zip(schedule.days, days)):
-        date, midnight, names, candidates_for_day = data
+    for index, (date, midnight) in enumerate(zip(dates, midnights, strict=True)):
         day = index + 1
-        report('verifying', 2 + count + index, day)
-        order = [v.candidate - 1 for v in timing]
-        if sorted(order) != list(range(len(names))):
-            raise PlanningFailure('VERIFICATION_FAILED', 'candidate_count', day)
+        report('checking', 1 + 2 * index, day)
+        slots = day_slots(conditions, index)
+        stops = await resolve(getattr(candidates, f'day_{day}'), slots, date)
         anchor = fixed_start(conditions, index)
-        timing = ordered_timing(timing, [s.slot for s in candidates_for_day], anchor is not None)
-        order = [v.candidate - 1 for v in timing]
-        stops = [candidates_for_day[i] for i in order]
+        starts = preferred_starts(slots, anchor)
+        report('verifying', 2 + 2 * index, day)
         free_slots = []
-        hours_replacement = None
+        replacement = None
         fitted = []
         while stops:
             fixed = minutes(anchor) if anchor and stops[0].slot == 'breakfast' else None
-            walks = await walking(stops, midnight)
             try:
-                stops, timing, fitted, walks = await fit_or_reorder(stops, timing, walks, day, fixed, midnight)
+                stops, fitted, walks = await fit_or_reorder(stops, starts, day, fixed, midnight)
                 break
             except VisitProblem as issue:
                 pos = issue.index
-                hours_issue = issue.reason in ('closed', 'visit_window', 'time_conflict')
+                if issue.reason == 'unconfirmed_area':
+                    left, right = stops[pos-1:pos+1]
+                    if replacement in (left, right):
+                        pos = stops.index(replacement)
+                    elif (sum(left.nearby_distance_km(s) is not None for s in stops) <
+                          sum(right.nearby_distance_km(s) is not None for s in stops)):
+                        pos -= 1  # Keep the cluster, including when the first place was the outlier.
+                stop = stops[pos]
                 if not repaired:
                     repaired = True
                     report('repairing', day=day)
-                    alternative = names[timing[pos].candidate - 1].nearbyAlternative
-                    replacement = await lookup(alternative, stops[pos].slot, date)
-                    if not replacement.problem and replacement.place_id not in {s.place_id for s in stops}:
-                        stops[pos] = replacement
-                        if hours_issue:
-                            hours_replacement = replacement
+                    alternate = Candidate(name=stop.alternative, nearbyAlternative=stop.label, stayMinutes=stop.stay)
+                    backup, = await resolve([alternate], [stop.slot], date)
+                    if not backup.problem and backup.place_id not in {s.place_id for s in stops}:
+                        stops[pos] = replacement = backup
                         continue
-                if not hours_issue:
-                    if issue.reason != 'no_walk' or hours_replacement not in stops[max(0, pos-1):pos+1]:
-                        raise
-                    pos = stops.index(hours_replacement)
                 free_slots.append(stops.pop(pos).slot)
-                timing.pop(pos)
+                starts.pop(pos)
 
         items, legs = [], []
         for i, (stop, (start, end)) in enumerate(zip(stops, fitted)):
@@ -187,16 +158,21 @@ async def build(conditions, ask, client, report):
             if stop.basis in ('regular', 'unknown'):
                 item['hoursBasis'] = stop.basis
             if items:
-                depart = await local_instant(zone, date, items[-1]['endTime'])
-                arrive = await local_instant(zone, date, start)
-                if (arrive - depart).total_seconds() < walks[i-1]*60:
-                    raise VisitProblem('time_conflict', day, i, stop.slot)
-                legs.append(dict(fromItemId=items[-1]['id'], toItemId=item['id'], mode='walking'))
+                leg = dict(fromItemId=items[-1]['id'], toItemId=item['id'], mode='walking')
+                if walks[i-1] is None:
+                    leg['status'] = 'unverified'
+                legs.append(leg)
             items.append(item)
+        verified = [i for i, leg in enumerate(legs) if leg.get('status') != 'unverified']
+        for i, (depart, arrive) in (await day_leg_times(zone, date, items, verified)).items():
+            if (arrive - depart).total_seconds() < walks[i]*60:
+                raise VisitProblem('time_conflict', day, i+1, stops[i+1].slot)
         content_days.append(dict(day=day, date=date.isoformat(), items=items, legs=legs))
         if free_slots:
             content_days[-1]['freeSlots'] = free_slots
     if not any(day['items'] for day in content_days):
+        if search_failed:
+            raise PlanningFailure('EXTERNAL_DATA_UNAVAILABLE', 'place_lookup')
         raise PlanningFailure('VERIFICATION_FAILED', 'no_visits')
     return dict(storage='place_ids', conditions=conditions.model_dump(mode='json'),
                 destination={**dest, 'name': dest['label']}, transportMode='walking',
@@ -206,8 +182,7 @@ async def build(conditions, ask, client, report):
 async def execute(job_id, conditions):
     inputs = outputs = attempts = 0
     uncertain = False
-    # One candidate plan, one schedule, and two checks per travel day.
-    total_steps = 2 + 2 * ((conditions.endDate - conditions.startDate).days + 1)
+    total_steps = 1 + 2 * ((conditions.endDate - conditions.startDate).days + 1)
     completed_steps = 0
 
     def report(stage, completed=0, day=None):
@@ -273,12 +248,22 @@ async def display_day(content, number):
                 day.pop('freeSlots', None)
                 continue
             items = day['items']
-            displays = await asyncio.gather(*(places.display(item['place']['providerPlaceId']) for item in items))
-            for item, place in zip(items, displays):
-                item['place'] = place
-            for i, leg in enumerate(day['legs']):
-                depart, arrive = await leg_times(content, day, i)
+            async def refresh(i, depart, arrive):
+                leg = day['legs'][i]
                 metrics = await route_option(client, config.maps_key, leg['mode'], items[i]['place']['providerPlaceId'],
                                              items[i+1]['place']['providerPlaceId'], depart, arrive)
                 leg.update(metrics)
+
+            # Both lookups use the stored place IDs. Cancel sibling requests on a detail failure.
+            try:
+                async with asyncio.TaskGroup() as group:
+                    details = [group.create_task(places.display(item['place']['providerPlaceId'])) for item in items]
+                    indices = [i for i, leg in enumerate(day['legs']) if leg.get('status') != 'unverified']
+                    times = await day_leg_times(content['destination']['timeZone'], day['date'], items, indices)
+                    for i, (depart, arrive) in times.items():
+                        group.create_task(refresh(i, depart, arrive))
+            except* PlanningFailure as errors:
+                raise errors.exceptions[0]
+            for item, detail in zip(items, details):
+                item['place'] = detail.result()
     return content

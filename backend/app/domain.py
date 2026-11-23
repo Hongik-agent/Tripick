@@ -157,6 +157,10 @@ def validate_draft(draft, uid, body, trip_id=None):
                 require(leg['fromItemId'] == items[index]['id'] and leg['toItemId'] == items[index+1]['id'])
                 if compact:
                     require(leg['mode'] in GOOGLE_MODES)
+                    require(leg.get('status') in (None, 'verified', 'unverified'))
+                    if leg.get('status') == 'unverified':
+                        require('durationMinutes' not in leg and 'distanceMeters' not in leg)
+                    require(time.fromisoformat(items[index]['endTime']) <= time.fromisoformat(items[index+1]['startTime']))
                     continue
                 require(leg['status'] == 'verified' and leg['mode'] in ('walking', 'transit', 'driving'))
                 require(leg['provider'] and datetime.fromisoformat(leg['checkedAt']).utcoffset() is not None)
@@ -232,7 +236,7 @@ async def generate(body: Conditions, request: Request, tasks: BackgroundTasks):
         await conn.execute(select(func.pg_advisory_xact_lock(7021101)))
         await conn.execute(update(jobs).where(jobs.c.status == 'running',
             jobs.c.created_at < stamp-timedelta(minutes=11)).values(status='failed', error_code='GENERATION_FAILED'))
-        fingerprint = hashlib.sha256(('prompt-v3:'+values['body_hash']).encode()).hexdigest()
+        fingerprint = hashlib.sha256(('prompt-v8:'+values['body_hash']).encode()).hexdigest()
         common = jobs.c.user_id == uid
         existing = await conn.scalar(select(jobs.c.id).where(common, jobs.c.fingerprint == fingerprint,
             jobs.c.version == 1, jobs.c.status == 'completed', jobs.c.expires_at > stamp))
@@ -320,7 +324,8 @@ async def leg_record(request, doc_id, day, leg, draft, write):
         fail(404,'RESOURCE_NOT_FOUND','이동 구간을 찾을 수 없습니다.')
     active_day = content['days'][day-1]
     left, right = active_day['items'][leg-1:leg+1]
-    depart, arrive = await generation.leg_times(content, active_day, leg-1)
+    times = await generation.day_leg_times(content['destination']['timeZone'], active_day['date'], active_day['items'], [leg-1])
+    depart, arrive = times[leg-1]
     return table, owner == uid, row, (left['place']['providerPlaceId'], right['place']['providerPlaceId'], depart, arrive)
 
 
@@ -346,6 +351,8 @@ async def choose_leg(doc_id: str, day: int, leg: int, body: LegSelection, reques
     content = deepcopy(row['content'])
     stored_leg = content['days'][day-1]['legs'][leg-1]
     stored_leg['mode'] = body.mode
+    if stored_leg.get('status') == 'unverified':
+        del stored_leg['status']
     version = row['version']+1
     async with engine.begin() as conn:
         statement = update(table).where(table.c.id == doc_id, owner, table.c.version == row['version'])
@@ -460,7 +467,10 @@ def public_copy(content):
             if item.get('hoursBasis') == 'unknown':
                 stop['hoursBasis'] = 'unknown'
             if index < len(day['legs']):
-                stop['outgoingMode'] = day['legs'][index]['mode']
+                leg = day['legs'][index]
+                stop['outgoingMode'] = leg['mode']
+                if leg.get('status') == 'unverified':
+                    stop['outgoingRouteUnverified'] = True
             places.append(stop)
     free_slots = {str(day['day']): day['freeSlots'] for day in content['days'] if day.get('freeSlots')}
     return dict(destinationName=dest['label'], destination={'id': dest['id']},

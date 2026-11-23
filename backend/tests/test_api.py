@@ -3,7 +3,7 @@ import base64
 import hashlib
 import os
 import unittest
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
@@ -19,7 +19,7 @@ os.environ['FRONTEND_ORIGIN'] = 'https://frontend.example'
 os.environ['SESSION_ENCRYPTION_KEY'] = Fernet.generate_key().decode()
 
 import httpx
-from sqlalchemy import insert, delete, select, update, func
+from sqlalchemy import insert, delete, select, update, func, event
 from app import auth, domain, config
 from app.main import app
 from app.models import users, trips, auth_sessions, posts, post_hearts, oauth_transactions
@@ -57,19 +57,67 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             party=dict(typeId='friends', sizeBand='2'), interestIds=['food'],
             paceId='relaxed', transportMode='walking', mapProvider='google')
 
+    async def test_postgres_batches_leg_times_across_a_dst_transition(self):
+        from app.generation import day_leg_times
+        items = [{'endTime': '00:30'}, {'startTime': '01:30', 'endTime': '01:45'}, {'startTime': '02:15'}]
+        statements = []
+        def record(conn, cursor, statement, parameters, context, executemany):
+            statements.append(statement)
+        event.listen(engine.sync_engine, 'before_cursor_execute', record)
+        try:
+            self.assertEqual(await day_leg_times('America/New_York', '2027-11-07', items, []), {})
+            result = await day_leg_times('America/New_York', '2027-11-07', items, [0, 1])
+        finally:
+            event.remove(engine.sync_engine, 'before_cursor_execute', record)
+        self.assertEqual(len(statements), 1)
+        def utc(hour, minute):
+            return datetime(2027, 11, 7, hour, minute, tzinfo=timezone.utc)
+        self.assertEqual(result, {0: (utc(4, 30), utc(6, 30)), 1: (utc(6, 45), utc(7, 15))})
+
+    async def test_seven_day_schedule_batches_timezone_queries(self):
+        from app import generation
+        from app.planning import Conditions
+
+        conditions = Conditions(**{**self.conditions(), 'destinationId': 'kr-incheon',
+                                   'startDate': '2027-01-11', 'endDate': '2027-01-17', 'paceId': 'packed'})
+
+        async def ask(task, schema):
+            return schema(**{f'day_{i+1}': [
+                dict(name=f'{i}-{j}', nearbyAlternative=f'대안{i}-{j}', stayMinutes=30)
+                for j in range(len(generation.day_slots(conditions, i)))] for i in range(7)})
+
+        def search(name, city):
+            return dict(id=name, types=['restaurant'], location=dict(latitude=37.4, longitude=126.7))
+
+        statements = []
+        def record(conn, cursor, statement, parameters, context, executemany):
+            statements.append(statement)
+
+        event.listen(engine.sync_engine, 'before_cursor_execute', record)
+        try:
+            with (patch.object(generation.GooglePlaces, 'search', side_effect=search),
+                  patch.object(generation.GooglePlaces, 'display', side_effect=lambda pid: dict(name=pid)),
+                  patch.object(generation, 'route_option', return_value=dict(
+                      mode='walking', status='verified', durationMinutes=5, distanceMeters=300))):
+                content = await generation.build(conditions, ask, None, lambda *args, **kwargs: None)
+                self.assertEqual(sum(len(d['items']) for d in content['days']), 47)
+                self.assertEqual(sum(len(d['legs']) for d in content['days']), 40)
+                self.assertEqual(len(statements), 8)  # Calendar once, then all leg times once per day.
+                statements.clear()
+                await generation.display_day(content, 1)
+                self.assertEqual(len(statements), 1)
+        finally:
+            event.remove(engine.sync_engine, 'before_cursor_execute', record)
+
     async def test_generate_verify_open_and_save(self):
         from app import generation
-        from app.itinerary_agent import Timetable
 
         app.dependency_overrides.pop(domain.verified_drafts)
-        inputs = dict(self.conditions(), modelId='gpt-6.1-terra')
-        times = Timetable(days=[[
-            dict(candidate=i+1, start=f'{10+i}:00', end=f'{10+i}:30') for i in range(4)
-        ]])
+        inputs = dict(self.conditions(), modelId='gpt-6.1-terra', destinationId='kr-jeju')
         usage = SimpleNamespace(input_tokens=50, output_tokens=100, total_tokens=150)
         async def model_response(conditions, task, api_key, output_type):
-            plan = times if output_type is Timetable else output_type(day_1=[
-                dict(name=f'장소{i}', nearbyAlternative=f'대안{i}') for i in range(4)])
+            plan = output_type(day_1=[
+                dict(name=f'장소{i}', nearbyAlternative=f'대안{i}', stayMinutes=45) for i in range(4)])
             return SimpleNamespace(final_output=plan, context_wrapper=SimpleNamespace(usage=usage))
         in_progress = []
 
@@ -78,18 +126,24 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
                 async with engine.connect() as conn:
                     job = await conn.scalar(select(generation.jobs.c.id).where(generation.jobs.c.user_id == self.uid))
                 in_progress.append((await self.client.get('/api/generations/' + job)).json())
-                return {'id': name, 'types': ['park']}
-            return {'id': name, 'types':['restaurant'], 'regularOpeningHours': {'periods': [{'open': {'day': 0, 'hour': 0}}]}}
+                return {'id': name, 'types': ['park'], 'location': {'latitude': 33.5, 'longitude': 126.52}}
+            return {'id': name, 'types':['restaurant'], 'location': {'latitude': 33.5, 'longitude': 126.53},
+                    'regularOpeningHours': {'periods': [{'open': {'day': 0, 'hour': 0}}]}}
 
         async def display(place_id):
-            return dict(providerPlaceId=place_id, name=place_id, latitude=35, longitude=139)
+            return dict(providerPlaceId=place_id, name=place_id, latitude=33.5, longitude=126.53)
+
+        def route(client, key, mode, left, right, *times):
+            if left == '장소0' and mode == 'walking':
+                return dict(mode=mode, status='no_route')
+            return dict(mode=mode, status='verified', durationMinutes=5, distanceMeters=300)
 
         with (patch.object(config, 'openai_key', 'test'), patch.object(config, 'maps_key', 'test'),
               patch.object(generation, 'run_planner', side_effect=model_response) as planner,
               patch.object(generation.GooglePlaces, 'search', side_effect=search),
               patch.object(generation.GooglePlaces, 'display', side_effect=display),
-              patch.object(generation, 'route_option', return_value=dict(
-                  mode='walking', status='verified', durationMinutes=5, distanceMeters=300))):
+              patch.object(generation, 'route_option', side_effect=route),
+              patch.object(domain, 'route_option', side_effect=route)):
             headers = {'Idempotency-Key': uuid4().hex}
             accepted = await self.client.post('/api/generations', json=inputs, headers=headers)
             self.assertEqual(accepted.status_code, 202, accepted.text)
@@ -99,17 +153,30 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(status['progress'], {'stage': 'completed', 'percent': 100})
             self.assertNotIn(job, generation.active_progress)
             self.assertEqual(in_progress[0]['status'], 'running')
-            self.assertEqual(in_progress[0]['progress'], {'stage': 'checking', 'percent': 25, 'day': 1})
+            self.assertEqual(in_progress[0]['progress'], {'stage': 'checking', 'percent': 33, 'day': 1})
             draft = (await self.client.get('/api/drafts/' + status['draftId'])).json()
             self.assertEqual(len(draft['days'][0]['items']), 4)
             self.assertEqual(draft['days'][0]['items'][0]['hoursBasis'], 'unknown')
-            self.assertEqual(draft['days'][0]['legs'][0]['durationMinutes'], 5)
+            self.assertEqual(draft['days'][0]['legs'][0]['status'], 'unverified')
+            self.assertNotIn('durationMinutes', draft['days'][0]['legs'][0])
+            self.assertEqual(draft['days'][0]['legs'][1]['durationMinutes'], 5)
             await self.client.post('/api/generations', json=inputs, headers=headers)
-            self.assertEqual(planner.await_count, 2)
+            self.assertEqual(planner.await_count, 1)
             self.assertTrue(all(call.args[0].modelId == inputs['modelId'] for call in planner.await_args_list))
             saved = await self.client.post('/api/trips', headers={'Idempotency-Key': uuid4().hex},
                                            json={'draftId': draft['id'], 'draftVersion': draft['version']})
             self.assertEqual(saved.status_code, 201, saved.text)
+            path = '/api/trips/' + saved.json()['id']
+            reopened = (await self.client.get(path)).json()
+            self.assertEqual(reopened['days'][0]['legs'][0]['status'], 'unverified')
+            publication = (await self.client.post(path + '/publication')).json()
+            public = (await self.client.get('/api/posts/' + publication['postId'])).json()
+            self.assertTrue(public['places'][0]['outgoingRouteUnverified'])
+            changed = await self.client.put(path + '/days/1/legs/1', json={'mode': 'driving'},
+                                            headers={'If-Match': str(reopened['version'])})
+            self.assertEqual(changed.status_code, 200, changed.text)
+            reopened = (await self.client.get(path)).json()
+            self.assertEqual(reopened['days'][0]['legs'][0]['status'], 'verified')
 
     def draft(self, uid, body):
         return dict(ownerId=str(uid), version=1, status='success', expiresAt=auth.now()+timedelta(hours=1),

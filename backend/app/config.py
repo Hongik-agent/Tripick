@@ -61,6 +61,7 @@ cors_headers = ["Content-Type", "X-CSRF-Token", "Idempotency-Key", "If-Match"]
 
 openai_key = os.getenv("OPENAI_API_KEY", "")
 maps_key = os.getenv("GOOGLE_MAPS_API_KEY", "")
+tour_api_key = os.getenv("TOUR_API_KEY", "").strip()
 generation_budget_krw = positive("GENERATION_MONTHLY_BUDGET_KRW", 50000)
 # 보수적인 원화 환산값(세금 포함). 운영자는 환율과 모델 단가 변경 시 조정한다.
 generation_krw_per_usd = positive("GENERATION_KRW_PER_USD", 1800)
