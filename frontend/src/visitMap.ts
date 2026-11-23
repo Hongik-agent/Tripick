@@ -2,6 +2,22 @@ import type { Item } from "./api"
 
 type Point = { lat: number; lng: number }
 export type MapVisit = Pick<Item, "id" | "place" | "order">
+type Coordinates = Pick<Item["place"], "latitude" | "longitude">
+
+export function approximateDistance(from?: Coordinates, to?: Coordinates): string | undefined {
+  if (!from || !to) return
+  if (![from, to].every(p => Number.isFinite(p.latitude) && Math.abs(p.latitude) <= 90 &&
+    Number.isFinite(p.longitude) && Math.abs(p.longitude) <= 180)) return
+
+  // Use the same local approximation as the scheduler uses to group nearby visits.
+  const meanLatitude = (from.latitude + to.latitude) / 2 * Math.PI / 180
+  const longitudeDelta = (to.longitude - from.longitude + 540) % 360 - 180
+  const meters = 111_200 * Math.hypot(to.latitude - from.latitude, longitudeDelta * Math.cos(meanLatitude))
+  if (meters < 10) return "10m 이내"
+  const roundedMeters = Math.round(meters / 10) * 10
+  return `약 ${roundedMeters.toLocaleString("ko-KR")}m`
+}
+
 type MapOptions = { center: Point; zoom: number }
 type Bounds = { extend(point: Point): void }
 type VisitMap = {

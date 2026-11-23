@@ -1,6 +1,16 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { drawVisits } from "../src/visitMap.ts"
+import { approximateDistance, drawVisits } from "../src/visitMap.ts"
+
+test("formats nearby visit distances from both coordinates in metres", () => {
+  const start = { latitude: 33.25, longitude: 126.56 }
+  assert.equal(approximateDistance(start, { ...start, longitude: 126.5686 }), "약 800m")
+  assert.equal(approximateDistance(start, { ...start, latitude: 33.261 }), "약 1,220m")
+  assert.equal(approximateDistance(start, start), "10m 이내")
+  assert.equal(approximateDistance(start, undefined), undefined)
+  assert.equal(approximateDistance({ ...start, latitude: null }, start), undefined)
+  assert.equal(approximateDistance(start, { ...start, longitude: 181 }), undefined)
+})
 
 test("numbers visits in list order, links selections and removes the previous day", (t) => {
   const pane = { children: [], append(element) { this.children.push(element) } }

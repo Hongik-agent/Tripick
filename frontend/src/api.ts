@@ -97,6 +97,7 @@ export type Post = {
     hoursBasis?: string
     googlePlaceId?: string
     outgoingMode?: "walking" | "transit" | "driving"
+    outgoingRouteUnverified?: boolean
   }[]
   heartCount: number
   heartedByMe: boolean

@@ -19,14 +19,12 @@ import {
 } from "./api"
 
 import GoogleMap from "./GoogleMap"
+import WorldMap from "./WorldMap"
+import { login } from "./auth"
 import { usePublicDayMap } from "./usePublicDayMap"
-import type { MapVisit } from "./visitMap"
+import { approximateDistance, type MapVisit } from "./visitMap"
 
 const emptyVisits: MapVisit[] = []
-
-import WorldMap from "./WorldMap"
-
-import { login } from "./auth"
 
 const countryLabels: Record<string, string> = {
   KR: "한국",
@@ -164,6 +162,14 @@ export default function App() {
   const generating = progress !== null
   const generationRequest = useRef<{ body: string; key: string } | null>(null)
   const submission = useRef<AbortController | null>(null)
+  const draftRequestStart = useRef<number | null>(null)
+
+  useEffect(() => {
+    if (page === "draft" && trip && draftRequestStart.current !== null) {
+      performance.measure("tripick.generation.result", { start: draftRequestStart.current })
+      draftRequestStart.current = null
+    }
+  }, [page, trip])
 
   const [legIndex, setLegIndex] = useState(0)
 
@@ -418,6 +424,9 @@ export default function App() {
   const publicDetail = page === "community"
   const StopGroup = publicDetail ? "div" : Fragment
   const detailDestination = trip?.destination
+  const isDomestic = detailDestination?.countryCode
+    ? detailDestination.countryCode === "KR"
+    : (detailDestination?.id ?? post?.destination?.id)?.startsWith("kr-")
   const detailLabel = trip?.destination.name ?? post?.destinationName ?? ""
   const providerId = draft ? form.mapProvider : trip?.conditions.mapProvider
   const provider = providersFor(detailDestination?.countryCode).find((p) => p.id === providerId) ?? mapProviders[0]
@@ -431,19 +440,23 @@ export default function App() {
       options.paces.find(v => v.id === savedConditions.paceId),
     ].map(v => v?.label).filter(Boolean) : []
   const tripPath = (draft ? "/drafts/" : "/trips/") + trip?.id
-  const dayItems = trip?.days.find((d) => d.day === day)?.items
+  const selectedDay = trip?.days.find(d => d.day === day)
   const publicMapEnabled = publicDetail && post?.publicMapAvailable && !publicMapFailed && !!import.meta.env.VITE_GOOGLE_MAPS_API_KEY
   const publicMap = usePublicDayMap(publicMapEnabled ? post?.id : undefined, day, mapPanel)
   const publicPoints = publicMap.result?.available ? publicMap.result.items : emptyVisits
+  const publicPlacesById = new Map(publicPoints.map(({ id, place }) => [id, place]))
   const publicMapShown = publicMapEnabled && (!publicMap.result || publicPoints.length > 0)
-  const items = dayItems?.map((item) => ({
-    ...item.place,
-    id: item.id,
-    googlePlaceId: item.place.providerPlaceId,
-    visitTime: item.startTime,
-    hoursBasis: item.hoursBasis,
-  })) ?? post?.places.filter((p) => p.day === day) ?? []
-  const freeSlots = trip?.days[day - 1]?.freeSlots ?? post?.freeSlots?.[day] ?? []
+  const items = selectedDay?.items.map(({ id, place, startTime, hoursBasis }, i) => {
+    const leg = selectedDay.legs[i]
+    return {
+      id, name: place.name, coordinates: place, googlePlaceId: place.providerPlaceId,
+      visitTime: startTime, hoursBasis,
+      outgoingRouteUnverified: !!leg && leg.status !== "verified" && leg.status !== "time_conflict",
+    }
+  }) ?? post?.places.filter(p => p.day === day).map(p => ({
+    ...p, id: p.mapPlaceId, coordinates: publicPlacesById.get(p.mapPlaceId),
+  })) ?? []
+  const freeSlots = selectedDay?.freeSlots ?? post?.freeSlots?.[day] ?? []
 
   const submitGeneration = () => void perform(async () => {
     // The selected link provider is a UI preference. The backend verifies places with Google.
@@ -453,16 +466,19 @@ export default function App() {
       generationRequest.current = { body, key: crypto.randomUUID() }
     const controller = new AbortController()
     submission.current = controller
+    const started = performance.now()
     setProgress({ stage: "submitting" })
     try {
       const result = await generateDraft(conditions, generationRequest.current.key, controller.signal, setProgress)
       if (controller.signal.aborted) return
+      draftRequestStart.current = started
       setTrip(result)
       setPost(null)
       setDay(1)
       go("draft")
       generationRequest.current = null
     } catch (e) {
+      if (!controller.signal.aborted) performance.measure("tripick.generation.failure", { start: started })
       if (e instanceof GenerationFailed || (e instanceof ApiError && e.code === "INVALID_DRAFT"))
         generationRequest.current = null
       if (!controller.signal.aborted) throw e
@@ -1012,16 +1028,17 @@ export default function App() {
             <section className="timeline">
               <h2>{publicDetail ? <>{day}일차 일정 <span>방문 장소 {items.length}곳</span></> : "방문 장소"}</h2>
               {items.map((item, i) => {
-                const leg = trip?.days[day-1]?.legs[i]
-                const visitId = "id" in item ? item.id : item.mapPlaceId
-                const selectable = "id" in item || publicPoints.some(point => point.id === visitId)
+                const leg = selectedDay?.legs[i]
+                const visitId = item.id
+                const showEstimate = isDomestic && item.outgoingRouteUnverified
+                const distance = showEstimate ? approximateDistance(item.coordinates, items[i + 1]?.coordinates) : undefined
                 return (
-                <StopGroup key={"id" in item ? item.id : item.mapPlaceId}>
+                <StopGroup key={visitId}>
                   <article id={"visit-" + visitId}
                     className={"place" + (visitSelection?.id === visitId ? " place-focused" : "")}>
                     <span className="place-number">{i + 1}</span>
                     <div>
-                      <h3>{selectable ? (
+                      <h3>{item.coordinates ? (
                         <button type="button" className="visit-select"
                           aria-label={`${i + 1}. ${item.name} 지도에서 보기`}
                           aria-pressed={visitSelection?.id === visitId}
@@ -1030,18 +1047,20 @@ export default function App() {
                             mapPanel.current?.scrollIntoView({ block: "nearest" })
                           }}>{item.name}</button>
                       ) : item.name}</h3>
-                      {"visitTime" in item && <p>{item.visitTime}</p>}
+                      {item.visitTime && <p>{item.visitTime}</p>}
                       {item.hoursBasis === "unknown" && <small>영업시간 확인 필요</small>}
                     </div>
                   </article>
                   <div className="place-actions">
-                    {"outgoingMode" in item && item.outgoingMode && (
-                      <span>{{ walking: "🚶 도보", transit: "🚇 대중교통", driving: "🚗 자동차" }[item.outgoingMode]}</span>
+                    {distance && <span className="leg-estimate"><span aria-hidden="true">📍</span>다음 장소까지 {distance}</span>}
+                    {!showEstimate && "outgoingMode" in item && item.outgoingMode && (
+                      <span>{item.outgoingRouteUnverified ? "이동 경로 확인 필요" : modeLabels[item.outgoingMode]}</span>
                     )}
-                    {leg && (
+                    {!showEstimate && leg && (
                       <button className="leg-button" disabled={busy} onClick={() => showLeg(i)}>
-                        {modeLabels[leg.mode]} · {leg.status === "verified"
-                          ? `${leg.durationMinutes}분 · ${leg.distanceMeters}m` : "경로 확인"} ›
+                        {item.outgoingRouteUnverified ? "이동 경로 확인 필요"
+                          : `${modeLabels[leg.mode]} · ${leg.durationMinutes}분 · ${leg.distanceMeters}m`}
+                        {leg.status === "time_conflict" && " · 다음 방문 시간 초과"} ›
                       </button>
                     )}
                     <a className="place-map-link"
@@ -1070,13 +1089,13 @@ export default function App() {
               {Array.from(new Set(publicPoints.flatMap(p => p.place.attributions?.map(a => a.provider).filter(Boolean) ?? []))).map(name =>
                 <small key={name}>{name}</small>)}
             </section>}
-            {!publicDetail && detailDestination && dayItems && <section className="route-map visit-map" ref={mapPanel}>
+            {!publicDetail && detailDestination && selectedDay && <section className="route-map visit-map" ref={mapPanel}>
               <p className="visit-map-legend">DAY {day} · 방문 순서</p>
               <GoogleMap
                 center={detailDestination.mapCenter}
                 zoom={detailDestination.mapZoom}
                 label={detailLabel}
-                items={dayItems}
+                items={selectedDay.items}
                 selection={visitSelection}
                 onSelect={selectMarker}
               />
@@ -1102,11 +1121,11 @@ export default function App() {
                 const option = legOptions.find(o => o.mode === mode)
                 const status = option?.status
                 return <button key={mode} className="leg-option" disabled={busy || status !== "verified"}
-                  aria-pressed={trip.days[day-1]?.legs[legIndex]?.mode === mode}
+                  aria-pressed={selectedDay?.legs[legIndex]?.mode === mode}
                   onClick={() => chooseLeg(mode)}>
                   <span>{label}</span><span>{status === "verified" ? option?.durationMinutes + "분" :
-                    status === "no_route" ? "이 구간은 경로 없음" : status === "time_conflict" ?
-                    "다음 방문 시간에 도착하기 어려워요" : busy ? "조회 중…" : "조회 실패"}</span>
+                    status === "no_route" ? "이 구간은 경로 없음" : option?.status === "time_conflict" ?
+                    `${option.durationMinutes}분 · 다음 방문 시간 초과` : busy ? "조회 중…" : "조회 실패"}</span>
                 </button>
               })}
               {(legError || legOptions.some(o => o.status === "lookup_failed")) &&
