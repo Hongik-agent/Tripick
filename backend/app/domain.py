@@ -9,7 +9,7 @@ from urllib.parse import quote
 from typing import Literal
 from copy import deepcopy
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Request, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Query
 import httpx
 import logging
 from fastapi.responses import Response
@@ -23,7 +23,7 @@ from .config import idempotency_ttl_seconds
 from .db import engine
 from .errors import fail
 from .models import users, trips, posts, post_hearts as hearts, idempotency_keys as keys
-from .planning import Conditions, options, DESTINATIONS, INTERESTS
+from .planning import Conditions, GenerationModel, options, DESTINATIONS, INTERESTS
 from . import config, generation
 from .models import generation_jobs as jobs, generation_requests as counters
 from .place_data import GooglePlaces, PlanningFailure
@@ -186,6 +186,42 @@ async def planning(request: Request):
     return dict(options(), generationAvailable=bool(config.openai_key and config.maps_key))
 
 
+def reservation_cost(model_id):
+    return generation.cost(model_id, generation.MAX_INPUT, generation.MAX_OUTPUT) * generation.MAX_ATTEMPTS
+
+
+async def generation_limit(conn, uid, stamp, reserved):
+    today = stamp.astimezone(timezone(timedelta(hours=9))).replace(hour=0, minute=0, second=0, microsecond=0)
+    month = today.replace(day=1)
+    mine = jobs.c.user_id == uid
+    daily, monthly, total, settled = (await conn.execute(select(
+        func.count().filter(mine, jobs.c.created_at >= today),
+        func.count().filter(mine),
+        func.coalesce(func.sum(jobs.c.cost_krw), 0),
+        func.coalesce(func.sum(jobs.c.cost_krw).filter(jobs.c.status != 'running'), 0),
+    ).where(jobs.c.created_at >= month))).one()
+    next_month = (month + timedelta(days=32)).replace(day=1).isoformat()
+    if reserved > config.generation_budget_krw:
+        return dict(code='BUDGET_EXHAUSTED', resetsAt=None), total
+    if monthly >= 20:
+        return dict(code='MONTHLY_LIMIT_REACHED', resetsAt=next_month), total
+    if total + reserved > config.generation_budget_krw:
+        # 진행 중인 작업의 예약 비용이 정산되면 월말 전에도 풀릴 수 있다.
+        reset = next_month if settled + reserved > config.generation_budget_krw else None
+        return dict(code='BUDGET_EXHAUSTED', resetsAt=reset), total
+    if daily >= 5:
+        return dict(code='DAILY_LIMIT_REACHED', resetsAt=(today + timedelta(days=1)).isoformat()), total
+    return None, total
+
+
+@router.get('/generation-limit')
+async def read_generation_limit(request: Request, modelId: GenerationModel):
+    uid = (await authenticate(request))['user_id']
+    async with engine.connect() as conn:
+        limit, _ = await generation_limit(conn, uid, now(), reservation_cost(modelId))
+    return {'limit': limit}
+
+
 async def limit_requests(request, uid, scope, per_user, per_ip):
     stamp = now()
     ip = request.client.host if request.client else 'unknown'
@@ -202,7 +238,6 @@ async def limit_requests(request, uid, scope, per_user, per_ip):
                 'count': case((expired, 1), else_=counters.c.count+1)
             }).returning(counters.c.count, counters.c.window_start))).first()
             if row[0] > maximum:
-                from fastapi import HTTPException
                 retry = max(1, math.ceil((row.window_start+timedelta(minutes=1)-stamp).total_seconds()))
                 raise HTTPException(429, dict(code='RATE_LIMITED', message='잠시 후 다시 시도해 주세요.'),
                                     headers={'Retry-After':str(retry)})
@@ -215,7 +250,6 @@ async def generate(body: Conditions, request: Request, tasks: BackgroundTasks):
     await limit_requests(request, uid, 'generate', 3, 30)
     if body.transportMode != 'walking':
         fail(422, 'INVALID_SELECTION', '최초 생성은 도보 기준입니다.')
-    stamp = now()
     async with engine.begin() as conn:
         await lock_user(conn, uid)
         if request.headers.get('idempotency-key'):
@@ -234,6 +268,7 @@ async def generate(body: Conditions, request: Request, tasks: BackgroundTasks):
             fail(503, 'GENERATION_UNAVAILABLE', '일정 생성 서비스 설정을 확인해 주세요.')
         # Serialize admission across workers, but never hold the lock during paid calls.
         await conn.execute(select(func.pg_advisory_xact_lock(7021101)))
+        stamp = now()
         await conn.execute(update(jobs).where(jobs.c.status == 'running',
             jobs.c.created_at < stamp-timedelta(minutes=11)).values(status='failed', error_code='GENERATION_FAILED'))
         fingerprint = hashlib.sha256(('prompt-v8:'+values['body_hash']).encode()).hexdigest()
@@ -246,15 +281,10 @@ async def generate(body: Conditions, request: Request, tasks: BackgroundTasks):
             return status
         if await conn.scalar(select(jobs.c.id).where(common, jobs.c.status == 'running').limit(1)):
             fail(429, 'GENERATION_IN_PROGRESS', '이미 생성 중입니다.')
-        today = stamp.astimezone(timezone(timedelta(hours=9))).replace(hour=0,minute=0,second=0,microsecond=0)
-        month = today.replace(day=1)
-        for start, maximum, code in [(today,5,'DAILY_LIMIT_REACHED'), (month,20,'MONTHLY_LIMIT_REACHED')]:
-            if await conn.scalar(select(func.count()).select_from(jobs).where(common, jobs.c.created_at >= start)) >= maximum:
-                fail(429, code, '생성 한도에 도달했습니다.')
-        reserved = generation.cost(body.modelId, generation.MAX_INPUT, generation.MAX_OUTPUT)*generation.MAX_ATTEMPTS
-        total = await conn.scalar(select(func.coalesce(func.sum(jobs.c.cost_krw),0)).where(jobs.c.created_at >= month))
-        if total + reserved > config.generation_budget_krw:
-            fail(429, 'BUDGET_EXHAUSTED', '이번 달 생성 예산을 모두 사용했습니다.')
+        reserved = reservation_cost(body.modelId)
+        limit, total = await generation_limit(conn, uid, stamp, reserved)
+        if limit:
+            raise HTTPException(429, {**limit, 'message': '생성 한도에 도달했습니다.', 'retryable': False})
         if total < 0.8*config.generation_budget_krw <= total+reserved:
             logging.getLogger(__name__).warning('Monthly generation budget reached 80 percent')
         job_id = 'gen_'+uuid4().hex
@@ -264,6 +294,18 @@ async def generate(body: Conditions, request: Request, tasks: BackgroundTasks):
         await remember(conn, values, status)
     tasks.add_task(generation.execute, job_id, body)
     return status
+
+
+@router.get('/generation-requests/{key}')
+async def find_generation_request(key: str, request: Request):
+    uid = (await authenticate(request))['user_id']
+    async with engine.connect() as conn:
+        accepted = await conn.scalar(select(keys.c.response).where(
+            keys.c.user_id == uid, keys.c.scope == 'POST:/api/generations',
+            keys.c.key == key, keys.c.expires_at > now()))
+    if accepted is None:
+        fail(404, 'GENERATION_REQUEST_NOT_FOUND', '확인할 수 있는 생성 요청이 없습니다.')
+    return accepted
 
 
 async def get_job(conn, uid, job_id, lock=False):

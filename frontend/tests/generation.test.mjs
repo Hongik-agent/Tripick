@@ -1,12 +1,22 @@
 import assert from "node:assert/strict"
 import test from "node:test"
-import { generateDraft, GenerationFailed } from "../src/api.ts"
+import { generateDraft, GenerationFailed, generationLimitMessage } from "../src/api.ts"
 
 const conditions = {
   modelId: "gpt-6.1-terra", destinationId: "kr-jeju", optionsVersion: "v1",
   startDate: "2027-01-10", endDate: "2027-01-13", party: { typeId: "solo", sizeBand: "1" },
   interestIds: ["food"], paceId: "relaxed", transportMode: "walking", mapProvider: "google",
 }
+
+test("a quota rejection carries the same reset time as the preflight notice", async (t) => {
+  const limit = { code: "MONTHLY_LIMIT_REACHED", resetsAt: "2026-12-31T15:00:00Z" }
+  t.mock.method(globalThis, "fetch", async () => Response.json({ error: limit }, { status: 429 }))
+  await assert.rejects(generateDraft(conditions, "request1", new AbortController().signal), err => {
+    assert.deepEqual(err.generationLimit, limit)
+    assert.match(generationLimitMessage(err.generationLimit), /이번 달.*1월 1일.*00:00\(한국 시간\)/)
+    return true
+  })
+})
 
 test("submits the selected conditions once and opens the completed draft", async (t) => {
   const draft = { id: "draft1", days: [{ day: 1, items: [{ id: "visit1" }] }] }
@@ -31,6 +41,18 @@ test("submits the selected conditions once and opens the completed draft", async
   assert.equal(request.method, "POST")
   assert.equal(request.headers.get("Idempotency-Key"), "request1")
   assert.deepEqual(JSON.parse(request.body), conditions)
+})
+
+test("checking a lost response retrieves the original draft without submitting again", async (t) => {
+  const signal = new AbortController().signal
+  const fetch = t.mock.method(globalThis, "fetch", async () => { throw new TypeError("offline") })
+  await assert.rejects(generateDraft(conditions, "request1", signal), { code: "NETWORK_UNAVAILABLE" })
+  const results = [{ generationId: "job1", status: "completed", draftId: "draft1" }, { id: "draft1" }]
+  fetch.mock.mockImplementation(async () => Response.json(results.shift()))
+  assert.deepEqual(await generateDraft(conditions, "request1", signal, undefined, true), { id: "draft1" })
+  assert.deepEqual(fetch.mock.calls.map(({ arguments: [path, init] }) => [init.method ?? "GET", path]), [
+    ["POST", "/api/generations"], ["GET", "/api/generation-requests/request1"], ["GET", "/api/drafts/draft1"],
+  ])
 })
 
 test("a failed verification surfaces its Korean alert and never opens a draft", async (t) => {

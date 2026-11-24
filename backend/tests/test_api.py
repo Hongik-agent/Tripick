@@ -57,6 +57,42 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             party=dict(typeId='friends', sizeBand='2'), interestIds=['food'],
             paceId='relaxed', transportMode='walking', mapProvider='google')
 
+    async def test_generation_limit_matches_admission_and_resets_at_korean_midnight(self):
+        model = 'gpt-6-luna'
+        path = '/api/generation-limit?modelId=' + model
+        # 한국 시간 12월 31일 오후 11시, 다음 달 경계도 함께 확인한다.
+        stamp = datetime(2026, 12, 31, 14, tzinfo=timezone.utc)
+
+        async def seed(count, created_at, uid):
+            async with engine.begin() as conn:
+                await conn.execute(insert(domain.jobs), [
+                    dict(id=uuid4().hex, user_id=uid, fingerprint=uuid4().hex,
+                         created_at=created_at, expires_at=created_at+timedelta(hours=1),
+                         status='failed', cost_krw=0) for _ in range(count)])
+
+        with (patch.object(domain, 'now', return_value=stamp) as clock,
+              patch.object(config, 'openai_key', 'test'), patch.object(config, 'maps_key', 'test')):
+            await seed(5, stamp, self.other)
+            await seed(4, stamp, self.uid)
+            self.assertEqual((await self.client.get(path)).json(), {'limit': None})
+            await seed(1, stamp, self.uid)
+            reset = '2027-01-01T00:00:00+09:00'
+            self.assertEqual((await self.client.get(path)).json()['limit'],
+                             dict(code='DAILY_LIMIT_REACHED', resetsAt=reset))
+            await seed(15, stamp-timedelta(days=1), self.uid)
+            limit = (await self.client.get(path)).json()['limit']
+            self.assertEqual(limit, dict(code='MONTHLY_LIMIT_REACHED', resetsAt=reset))
+            rejected = await self.client.post('/api/generations', json=self.conditions(),
+                                              headers={'Idempotency-Key': uuid4().hex})
+            self.assertEqual(rejected.status_code, 429)
+            self.assertEqual({k: rejected.json()['error'][k] for k in limit}, limit)
+            clock.return_value = stamp+timedelta(hours=1)
+            self.assertEqual((await self.client.get(path)).json(), {'limit': None})
+            with patch.object(config, 'generation_budget_krw', domain.reservation_cost(model)):
+                self.assertIsNone((await self.client.get(path)).json()['limit'])
+                premium = await self.client.get('/api/generation-limit?modelId=gpt-6.1-terra')
+                self.assertEqual(premium.json()['limit'], dict(code='BUDGET_EXHAUSTED', resetsAt=None))
+
     async def test_postgres_batches_leg_times_across_a_dst_transition(self):
         from app.generation import day_leg_times
         items = [{'endTime': '00:30'}, {'startTime': '01:30', 'endTime': '01:45'}, {'startTime': '02:15'}]
@@ -147,6 +183,11 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             headers = {'Idempotency-Key': uuid4().hex}
             accepted = await self.client.post('/api/generations', json=inputs, headers=headers)
             self.assertEqual(accepted.status_code, 202, accepted.text)
+            with patch.object(config, 'generation_budget_krw', 1):
+                recovered = await self.client.get('/api/generation-requests/' + headers['Idempotency-Key'])
+                self.assertEqual(recovered.json(), accepted.json())
+                missing = await self.client.get('/api/generation-requests/' + uuid4().hex)
+                self.assertEqual(missing.json()['error']['code'], 'GENERATION_REQUEST_NOT_FOUND')
             job = accepted.json()['generationId']
             status = (await self.client.get('/api/generations/' + job)).json()
             self.assertEqual(status['status'], 'completed', status)

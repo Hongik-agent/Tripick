@@ -119,6 +119,7 @@ header{height:86px;max-width:1320px;margin:auto;display:flex;align-items:center;
 .review-panel h2, .review-panel .summary { margin: 0; }
 .generation-actions { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; }
 .generation-actions label { display: grid; gap: 6px; margin: 0; }
+#generation-limit { flex: 1 1 210px; align-self: center; margin: 0; font-size: 13px; line-height: 1.5; color: #475d55; }
 .generation-progress { width: min(100%, 420px); }
 .generation-progress > div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; font-size: 14px; }
 .generation-progress strong { color: #217b64; font-variant-numeric: tabular-nums; }

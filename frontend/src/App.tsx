@@ -6,6 +6,7 @@ import {
   clearAuth,
   restoreAuth,
   generateDraft,
+  generationLimitMessage,
   GenerationFailed,
   type GenerationProgress,
   type Leg,
@@ -22,6 +23,7 @@ import GoogleMap from "./GoogleMap"
 import WorldMap from "./WorldMap"
 import { login } from "./auth"
 import { usePublicDayMap } from "./usePublicDayMap"
+import { useGenerationLimit } from "./useGenerationLimit"
 import { approximateDistance, type MapVisit } from "./visitMap"
 
 const emptyVisits: MapVisit[] = []
@@ -52,6 +54,7 @@ const modeLabels: Record<string, string> = { walking: "🚶 도보", transit: "�
 
 const progressLabels: Record<GenerationProgress["stage"], string> = {
   submitting: "생성 요청을 보내는 중",
+  recovering: "이전 생성 요청을 확인하는 중",
   queued: "생성 요청 접수 완료",
   running: "일정을 생성하는 중",
   planning: "방문 후보를 고르는 중",
@@ -161,7 +164,7 @@ export default function App() {
   const [legError, setLegError] = useState("")
   const [progress, setProgress] = useState<GenerationProgress | null>(null)
   const generating = progress !== null
-  const generationRequest = useRef<{ body: string; key: string } | null>(null)
+  const [generationRequest, setGenerationRequest] = useState<{ body: string; key: string; recover: boolean } | null>(null)
   const submission = useRef<AbortController | null>(null)
   const draftRequestStart = useRef<number | null>(null)
 
@@ -252,7 +255,7 @@ export default function App() {
 
     const expired = () => {
       submission.current?.abort()
-      generationRequest.current = null
+      setGenerationRequest(null)
       sessionEpoch.current++
 
       clearAuth()
@@ -342,7 +345,7 @@ export default function App() {
 
     void perform(async () => {
       setOptions(await api<Options>("/planning-options"))
-      generationRequest.current = null
+      setGenerationRequest(null)
       setForm(initial)
       setStep(0)
       go("form")
@@ -459,30 +462,46 @@ export default function App() {
   })) ?? []
   const freeSlots = selectedDay?.freeSlots ?? post?.freeSlots?.[day] ?? []
 
+  const review = page === "form" && step === 4 && !!options && !modal
+  const modelId = form.modelId ?? initial.modelId
+  const quota = useGenerationLimit(review && user && options.generationAvailable ? modelId : undefined)
+  const conditions = { ...form, mapProvider: "google" }
+  const body = JSON.stringify(conditions)
+  const previousRequest = generationRequest?.body === body ? generationRequest : null
+  const recovering = previousRequest?.recover ?? false
+
   const submitGeneration = () => void perform(async () => {
-    // The selected link provider is a UI preference. The backend verifies places with Google.
-    const conditions = { ...form, mapProvider: "google" }
-    const body = JSON.stringify(conditions)
-    if (generationRequest.current?.body !== body)
-      generationRequest.current = { body, key: crypto.randomUUID() }
+    const request = previousRequest ?? { body, key: crypto.randomUUID(), recover: false }
+    setGenerationRequest(request)
     const controller = new AbortController()
     submission.current = controller
     const started = performance.now()
-    setProgress({ stage: "submitting" })
+    setProgress({ stage: recovering ? "recovering" : "submitting" })
     try {
-      const result = await generateDraft(conditions, generationRequest.current.key, controller.signal, setProgress)
+      const result = await generateDraft(conditions, request.key, controller.signal, setProgress, recovering)
       if (controller.signal.aborted) return
       draftRequestStart.current = started
       setTrip(result)
       setPost(null)
       setDay(1)
       go("draft")
-      generationRequest.current = null
+      setGenerationRequest(null)
     } catch (e) {
-      if (!controller.signal.aborted) performance.measure("tripick.generation.failure", { start: started })
-      if (e instanceof GenerationFailed || (e instanceof ApiError && e.code === "INVALID_DRAFT"))
-        generationRequest.current = null
-      if (!controller.signal.aborted) throw e
+      if (controller.signal.aborted) return
+      performance.measure("tripick.generation.failure", { start: started })
+      if (e instanceof ApiError && e.generationLimit) {
+        quota.applyLimit(e.generationLimit)
+        return
+      }
+      if (e instanceof GenerationFailed || (e instanceof ApiError && e.code === "INVALID_DRAFT")) {
+        setGenerationRequest(null)
+      } else if (e instanceof ApiError && e.code === "GENERATION_REQUEST_NOT_FOUND") {
+        setGenerationRequest({ ...request, recover: false })
+      } else if (!(e instanceof ApiError) || e.status === 0 || e.status >= 500) {
+        setGenerationRequest({ ...request, recover: true })
+      }
+      void quota.refresh()
+      throw e
     } finally {
       submission.current = null
       setProgress(null)
@@ -551,7 +570,6 @@ export default function App() {
   const updateForm = (key: keyof Conditions, value: string) =>
     setForm((f) => ({ ...f, [key]: value }))
 
-  const review = page === "form" && step === 4 && !!options && !modal
   const errorAlert = error && (
     <p role="alert" className="error-message">
       {error}{" "}
@@ -895,7 +913,7 @@ export default function App() {
                         일정 생성 모델
                         <select
                           disabled={generating}
-                          value={form.modelId ?? initial.modelId}
+                          value={modelId}
                           onChange={(e) => updateForm("modelId", e.target.value)}
                         >
                           <option value="gpt-6-luna">GPT-6 Luna</option>
@@ -905,12 +923,15 @@ export default function App() {
                       </label>
                       <button
                         className="primary"
-                        disabled={busy || !options.generationAvailable || !destination || duration < 1 ||
-                          duration > 7 || !form.interestIds.length}
+                        disabled={busy || (!recovering && (!options.generationAvailable || quota.limit !== null ||
+                          !destination || duration < 1 || duration > 7 || !form.interestIds.length))}
+                        aria-describedby={!recovering && quota.limit ? "generation-limit" : undefined}
                         onClick={submitGeneration}
                       >
-                        {generating ? "AI 일정 생성 중…" : "AI 일정 생성"}
+                        {recovering ? (generating ? "결과 확인 중…" : "생성 결과 확인") :
+                          (generating ? "AI 일정 생성 중…" : "AI 일정 생성")}
                       </button>
+                      {quota.limit && <p id="generation-limit" role="status">{generationLimitMessage(quota.limit)}</p>}
                     </div>
                     {progress && (
                       <div className="generation-progress">

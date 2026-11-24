@@ -81,9 +81,12 @@ class Party(BaseModel):
     sizeBand: Literal['1','2','3','4','5_plus']
 
 
+GenerationModel = Literal['gpt-6-luna', 'gpt-6.1-terra']
+
+
 class Conditions(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    modelId: Literal['gpt-6-luna', 'gpt-6.1-terra'] = 'gpt-6-luna'
+    modelId: GenerationModel = 'gpt-6-luna'
     optionsVersion: Literal['v1'] = 'v1'
     destinationId: str
     startDate: date
