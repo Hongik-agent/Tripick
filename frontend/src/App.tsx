@@ -1230,6 +1230,7 @@ export default function App() {
                 >
                   Google로 로그인
                 </button>
+                {/* 현재 배포에서는 카카오 로그인을 사용하지 않는다.
                 <button
                   className="secondary"
                   disabled={busy}
@@ -1237,6 +1238,7 @@ export default function App() {
                 >
                   Kakao로 로그인
                 </button>
+                */}
               </>
             ) : modal === "account" ? (
               <>
