@@ -43,8 +43,9 @@ const countryLabels: Record<string, string> = {
 
 const mapProviders = [
   { id: "google", label: "구글맵", search: "https://www.google.com/maps/search/?api=1&query=" },
-  { id: "naver", label: "네이버 지도", search: "https://map.naver.com/p/search/" },
-  { id: "kakao", label: "카카오맵", search: "https://map.kakao.com/link/search/" },
+  // 현재 배포에서는 구글맵만 제공한다.
+  // { id: "naver", label: "네이버 지도", search: "https://map.naver.com/p/search/" },
+  // { id: "kakao", label: "카카오맵", search: "https://map.kakao.com/link/search/" },
 ]
 
 const modeLabels: Record<string, string> = { walking: "🚶 도보", transit: "🚇 대중교통", driving: "🚗 자동차" }
@@ -1128,8 +1129,6 @@ export default function App() {
                     `${option.durationMinutes}분 · 다음 방문 시간 초과` : busy ? "조회 중…" : "조회 실패"}</span>
                 </button>
               })}
-              {(legError || legOptions.some(o => o.status === "lookup_failed")) &&
-                <button className="secondary" disabled={busy} onClick={() => showLeg(legIndex)}>다시 조회</button>}
             </dialog>
           )}
           <div className="result-actions">
